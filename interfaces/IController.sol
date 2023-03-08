@@ -5,11 +5,18 @@ import "./pools/IConicPool.sol";
 import "./IOracle.sol";
 import "./tokenomics/IInflationManager.sol";
 import "./tokenomics/IRebalancingRewardsHandler.sol";
+import "./tokenomics/ILpTokenStaker.sol";
 import "./ICurveRegistryCache.sol";
 
 interface IController {
     event PoolAdded(address indexed pool);
     event PoolRemoved(address indexed pool);
+    event ConvexBoosterSet(address convexBooster);
+    event CurveHandlerSet(address curveHandler);
+    event ConvexHandlerSet(address convexHandler);
+    event InflationManagerSet(address inflationManager);
+    event PriceOracleSet(address priceOracle);
+    event WeightUpdateMinDelaySet(uint256 weightUpdateMinDelay);
 
     struct WeightUpdate {
         address conicPoolAddress;
@@ -22,6 +29,8 @@ interface IController {
 
     // views
     function curveRegistryCache() external view returns (ICurveRegistryCache);
+
+    function lpTokenStaker() external view returns (ILpTokenStaker);
 
     // oracle
     function priceOracle() external view returns (IOracle);

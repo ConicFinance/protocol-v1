@@ -83,9 +83,9 @@ contract DerivativeOracle is IOracle, Ownable {
 
         // Returning the value of the pool in USD per LP Token
         return
-            curvePool
-                .getV1LpTokenPrice(prices[0].divDown(prices[1]), prices[1].divDown(prices[0]))
-                .mulDown(prices[1]);
+            curvePool.getV1LpTokenPrice(prices[0].divDown(prices[1]), ScaledMath.ONE).mulDown(
+                prices[1]
+            );
     }
 
     function setImbalanceThreshold(uint256 threshold) external onlyOwner {

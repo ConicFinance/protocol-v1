@@ -171,7 +171,7 @@ contract InflationManager is IInflationManager, Ownable {
         uint256 numPools = _pools.length;
         for (uint256 i = 0; i < numPools; i++) {
             address curPool = _pools[i];
-            IRewardManager(IConicPool(curPool).rewardManager()).poolCheckpoint();
+            controller.lpTokenStaker().checkpoint(curPool);
             currentPoolWeights[curPool] = poolWeights[i];
         }
     }

@@ -26,10 +26,11 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
 
     uint128 internal constant _MIN_LOCK_TIME = 120 days;
     uint128 internal constant _MAX_LOCK_TIME = 240 days;
-    uint128 internal constant _GRACE_PERIOD = 30 days;
+    uint128 internal constant _GRACE_PERIOD = 28 days;
     uint128 internal constant _MIN_BOOST = 1e18;
     uint128 internal constant _MAX_BOOST = 1.5e18;
-    uint128 internal constant _KICK_PENALTY = 5e16;
+    uint128 internal constant _KICK_PENALTY = 1e17;
+    uint256 internal constant _MAX_KICK_PENALTY_AMOUNT = 1000e18;
     uint128 constant _AIRDROP_DURATION = 182 days;
 
     ICNCToken public immutable cncToken;
@@ -39,6 +40,7 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
     mapping(address => uint256) public lockedBoosted;
     mapping(address => VoteLock[]) public voteLocks;
     mapping(address => uint256) public _airdroppedBoost;
+    mapping(address => bool) public _claimedAirdrop;
     uint256 public immutable airdropEndTime;
     bytes32 public immutable merkleRoot;
     uint256 public totalLocked;
@@ -100,8 +102,9 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
 
         uint256 airdropBoost_ = airdropBoost(msg.sender);
         if (airdropBoost_ > 0) {
+            _claimedAirdrop[msg.sender] = true;
             boost = boost.mulDownUint128(uint128(airdropBoost_));
-            _airdroppedBoost[msg.sender] = 0;
+            delete _airdroppedBoost[msg.sender];
         }
 
         uint128 unlockTime = uint128(block.timestamp) + lockTime;
@@ -136,24 +139,24 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
     /// @notice Process all expired locks of msg.sender and withdraw unlocked CNC.
     function executeAvailableUnlocks() external override returns (uint256) {
         _feeCheckpoint(msg.sender);
-        uint256 sumUnlockable = 0;
+        uint256 sumUnlockable;
+        uint256 sumBoosted;
         VoteLock[] storage _pending = voteLocks[msg.sender];
         uint256 i = _pending.length;
         while (i > 0) {
             i = i - 1;
 
-            if (isShutdown) {
+            if (isShutdown || _pending[i].unlockTime <= block.timestamp) {
                 sumUnlockable += _pending[i].amount;
-                _pending[i] = _pending[_pending.length - 1];
-                _pending.pop();
-            } else if (_pending[i].unlockTime <= block.timestamp) {
-                sumUnlockable += _pending[i].amount;
+                sumBoosted += _pending[i].amount.mulDown(_pending[i].boost);
                 _pending[i] = _pending[_pending.length - 1];
                 _pending.pop();
             }
         }
         totalLocked -= sumUnlockable;
+        totalBoosted -= sumBoosted;
         lockedBalance[msg.sender] -= sumUnlockable;
+        lockedBoosted[msg.sender] -= sumBoosted;
         cncToken.safeTransfer(msg.sender, sumUnlockable);
         emit UnlockExecuted(msg.sender, sumUnlockable);
         return sumUnlockable;
@@ -195,7 +198,10 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
     }
 
     function recoverToken(address token) external override {
-        require(token != address(cncToken), "cannot withdraw cnc token");
+        require(
+            token != address(cncToken) && token != address(crv) && token != address(cvx),
+            "cannot withdraw token"
+        );
         IERC20 _token = IERC20(token);
         _token.safeTransfer(treasury, _token.balanceOf(address(this)));
     }
@@ -270,12 +276,16 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
             _pending[lockIndex].unlockTime + _GRACE_PERIOD <= uint128(block.timestamp),
             "cannot kick this lock"
         );
+        _feeCheckpoint(user);
         uint256 amount = _pending[lockIndex].amount;
         totalLocked -= amount;
         totalBoosted -= amount.mulDown(_pending[lockIndex].boost);
         lockedBalance[user] -= amount;
         lockedBoosted[user] -= amount.mulDown(_pending[lockIndex].boost);
         uint256 kickPenalty = amount.mulDown(_KICK_PENALTY);
+        if (kickPenalty > _MAX_KICK_PENALTY_AMOUNT) {
+            kickPenalty = _MAX_KICK_PENALTY_AMOUNT;
+        }
         cncToken.safeTransfer(user, amount - kickPenalty);
         cncToken.safeTransfer(msg.sender, kickPenalty);
         emit KickExecuted(user, msg.sender, amount);
@@ -284,8 +294,8 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
     }
 
     function receiveFees(uint256 amountCrv, uint256 amountCvx) external override {
-        crv.transferFrom(msg.sender, address(this), amountCrv);
-        cvx.transferFrom(msg.sender, address(this), amountCvx);
+        crv.safeTransferFrom(msg.sender, address(this), amountCrv);
+        cvx.safeTransferFrom(msg.sender, address(this), amountCvx);
         accruedFeesIntegralCrv += amountCrv.divDown(totalBoosted);
         accruedFeesIntegralCvx += amountCvx.divDown(totalBoosted);
         emit FeesReceived(msg.sender, amountCrv, amountCvx);
@@ -308,7 +318,7 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
         MerkleProof.Proof calldata proof
     ) external override {
         require(block.timestamp < airdropEndTime, "airdrop ended");
-        require(_airdroppedBoost[claimer] == 0, "already claimed");
+        require(!_claimedAirdrop[claimer], "already claimed");
         bytes32 node = keccak256(abi.encodePacked(claimer, amount));
         require(proof.isValid(node, merkleRoot), "invalid proof");
         _airdroppedBoost[claimer] = amount;
@@ -316,7 +326,7 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
     }
 
     function claimableFees(address account) external view returns (uint256[2] memory) {
-        uint256 boost_ = totalRewardsBoost(account);
+        uint256 boost_ = lockedBoosted[account];
         uint256 claimableCrv = perAccountFeesCrv[account] +
             boost_.mulDown(accruedFeesIntegralCrv - perAccountAccruedCrv[account]);
         uint256 claimableCvx = perAccountFeesCvx[account] +
@@ -329,7 +339,7 @@ contract CNCLockerV2 is ICNCLockerV2, Ownable {
     }
 
     function _feeCheckpoint(address account) internal {
-        uint256 boost_ = totalRewardsBoost(account);
+        uint256 boost_ = lockedBoosted[account];
         perAccountFeesCrv[account] += boost_.mulDown(
             accruedFeesIntegralCrv - perAccountAccruedCrv[account]
         );

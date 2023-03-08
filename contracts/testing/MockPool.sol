@@ -9,24 +9,17 @@ import "../../interfaces/tokenomics/ILpTokenStaker.sol";
 import "../LpToken.sol";
 
 contract MockRewardManager is IRewardManager {
-    uint256 internal _totalCRVClaimed;
     address public immutable override pool;
 
     constructor(address _pool) {
         pool = _pool;
     }
 
-    function setTotalCRVClaimed(uint256 amount) external {
-        _totalCRVClaimed = amount;
-    }
-
-    function totalCRVClaimed() external view returns (uint256) {
-        return _totalCRVClaimed;
-    }
-
     function accountCheckpoint(address account) external {}
 
-    function poolCheckpoint() external {}
+    function poolCheckpoint() external pure returns (bool) {
+        return true;
+    }
 
     function addExtraReward(address reward) external returns (bool) {}
 
@@ -57,20 +50,11 @@ contract MockRewardManager is IRewardManager {
         )
     {}
 
-    function claimEarnings(uint256 minRewardTokensTargetAmount)
-        external
-        returns (
-            uint256,
-            uint256,
-            uint256
-        )
-    {}
-
     function claimPoolEarnings() external {}
 
-    function sellRewardTokens(uint256 minTargetAmount) external {}
+    function sellRewardTokens() external {}
 
-    function claimPoolEarningsAndSellRewardTokens(uint256 minRewardTokensTargetAmount) external {}
+    function claimPoolEarningsAndSellRewardTokens() external {}
 }
 
 contract MockPool is IConicPool {
@@ -191,4 +175,8 @@ contract MockPool is IConicPool {
     function removeCurvePool(address pool) external {}
 
     function addCurvePool(address pool) external {}
+
+    function usdExchangeRate() external view override returns (uint256) {
+        return 1e18;
+    }
 }

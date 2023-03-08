@@ -4,6 +4,7 @@ pragma solidity 0.8.17;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 import "../interfaces/pools/IConicPool.sol";
 import "../interfaces/pools/ILpToken.sol";
@@ -11,6 +12,7 @@ import "../interfaces/pools/IRewardManager.sol";
 import "../interfaces/IConvexHandler.sol";
 import "../interfaces/ICurveHandler.sol";
 import "../interfaces/IController.sol";
+import "../interfaces/IOracle.sol";
 import "../interfaces/tokenomics/IInflationManager.sol";
 import "../interfaces/tokenomics/ILpTokenStaker.sol";
 import "../interfaces/tokenomics/ICNCLockerV2.sol";
@@ -34,6 +36,7 @@ contract RewardManager is IRewardManager, Ownable {
         ICurvePoolV2(0x838af967537350D2C44ABB8c010E49E32673ab94);
 
     uint256 public constant MAX_FEE_PERCENTAGE = 3e17;
+    uint256 public constant SLIPPAGE_THRESHOLD = 0.95e18; // 5% slippage as a multiplier
 
     bytes32 internal constant _CNC_KEY = "cnc";
     bytes32 internal constant _CRV_KEY = "crv";
@@ -46,9 +49,8 @@ contract RewardManager is IRewardManager, Ownable {
     ILpTokenStaker public immutable lpTokenStaker;
     ICNCLockerV2 public immutable locker;
 
-    uint256 public totalCRVClaimed;
-
     uint256 internal _oldCrvBalance;
+    uint256 internal _oldCvxBalance;
 
     EnumerableSet.AddressSet internal _extraRewards;
     mapping(address => address) public extraRewardsCurvePool;
@@ -74,29 +76,22 @@ contract RewardManager is IRewardManager, Ownable {
         locker = ICNCLockerV2(cncLocker);
     }
 
-    function poolCheckpoint() public override {
+    /// @notice Updates the internal fee accounting state. Returns `true` if rewards were claimed
+    function poolCheckpoint() public override returns (bool) {
         IConvexHandler convexHandler = IConvexHandler(controller.convexHandler());
 
         (uint256 crvEarned, uint256 cvxEarned, uint256 cncEarned) = _getEarnedRewards(
             convexHandler
         );
 
+        uint256 crvFee;
+        uint256 cvxFee;
+
         if (feesEnabled) {
-            uint256 crvFee = crvEarned.mulDown(feePercentage);
-            uint256 cvxFee = cvxEarned.mulDown(feePercentage);
+            crvFee = crvEarned.mulDown(feePercentage);
+            cvxFee = cvxEarned.mulDown(feePercentage);
             crvEarned = crvEarned - crvFee;
             cvxEarned = cvxEarned - cvxFee;
-            if (crvFee > CRV.balanceOf(pool) || cvxFee > CVX.balanceOf(pool)) {
-                claimPoolEarningsAndSellRewardTokens(0);
-            }
-
-            CRV.safeTransferFrom(pool, address(this), crvFee);
-            CVX.safeTransferFrom(pool, address(this), cvxFee);
-
-            // Fee transfer to the CNC locker
-            CRV.approve(address(locker), crvFee);
-            CVX.approve(address(locker), cvxFee);
-            locker.receiveFees(crvFee, cvxFee);
         }
 
         uint256 _totalStaked = lpTokenStaker.getBalanceForPool(pool);
@@ -105,6 +100,30 @@ contract RewardManager is IRewardManager, Ownable {
             _updateEarned(_CRV_KEY, crvEarned, _totalStaked);
             _updateEarned(_CNC_KEY, cncEarned, _totalStaked);
         }
+
+        if (!feesEnabled) {
+            return false;
+        }
+
+        bool rewardsClaimed = false;
+
+        if (crvFee > CRV.balanceOf(pool) || cvxFee > CVX.balanceOf(pool)) {
+            _claimPoolEarningsAndSellRewardTokens();
+            rewardsClaimed = true;
+        }
+
+        CRV.safeTransferFrom(pool, address(this), crvFee);
+        CVX.safeTransferFrom(pool, address(this), cvxFee);
+
+        // Fee transfer to the CNC locker
+        CRV.safeApprove(address(locker), crvFee);
+        CVX.safeApprove(address(locker), cvxFee);
+        locker.receiveFees(crvFee, cvxFee);
+
+        _oldCrvBalance = CRV.balanceOf(pool);
+        _oldCvxBalance = CVX.balanceOf(pool);
+
+        return rewardsClaimed;
     }
 
     function _updateEarned(
@@ -112,10 +131,8 @@ contract RewardManager is IRewardManager, Ownable {
         uint256 earned,
         uint256 _totalSupply
     ) internal {
-        _rewardsMeta[key].earnedIntegral += (earned - _rewardsMeta[key].lastEarned).divDown(
-            _totalSupply
-        );
-        _rewardsMeta[key].lastEarned = earned;
+        _rewardsMeta[key].earnedIntegral += earned.divDown(_totalSupply);
+        _rewardsMeta[key].lastEarned += earned;
     }
 
     function _getEarnedRewards()
@@ -141,12 +158,23 @@ contract RewardManager is IRewardManager, Ownable {
         )
     {
         address[] memory curvePools = IConicPool(pool).allCurvePools();
-        crvEarned =
-            CRV.balanceOf(pool) -
-            _oldCrvBalance +
-            convexHandler.getCrvEarnedBatch(pool, curvePools);
-        cvxEarned = convexHandler.computeClaimableConvex(crvEarned);
-        cncEarned = lpTokenStaker.claimableCnc(pool);
+
+        uint256 claimableCRV = convexHandler.getCrvEarnedBatch(pool, curvePools);
+        uint256 totalCRVEarned = CRV.balanceOf(pool) - _oldCrvBalance + claimableCRV;
+
+        uint256 claimableCVX = convexHandler.computeClaimableConvex(claimableCRV);
+        uint256 totalCVXEarned = CVX.balanceOf(pool) - _oldCvxBalance + claimableCVX;
+        uint256 totalCNCEarned = lpTokenStaker.claimableCnc(pool);
+
+        if (totalCRVEarned > _rewardsMeta[_CRV_KEY].lastEarned) {
+            crvEarned = totalCRVEarned - _rewardsMeta[_CRV_KEY].lastEarned;
+        }
+        if (totalCVXEarned > _rewardsMeta[_CVX_KEY].lastEarned) {
+            cvxEarned = totalCVXEarned - _rewardsMeta[_CVX_KEY].lastEarned;
+        }
+        if (totalCNCEarned > _rewardsMeta[_CNC_KEY].lastEarned) {
+            cncEarned = totalCNCEarned - _rewardsMeta[_CNC_KEY].lastEarned;
+        }
     }
 
     function accountCheckpoint(address account) external {
@@ -172,25 +200,12 @@ contract RewardManager is IRewardManager, Ownable {
         meta.accountIntegral[account] = meta.earnedIntegral;
     }
 
-    function claimEarnings()
-        external
-        override
-        returns (
-            uint256,
-            uint256,
-            uint256
-        )
-    {
-        return claimEarnings(0);
-    }
-
     /// @notice Claims all CRV, CVX and CNC earned by a user. All extra reward
     /// tokens earned will be sold for CNC.
     /// @dev Conic pool LP tokens need to be staked in the `LpTokenStaker` in
     /// order to receive a share of the CRV, CVX and CNC earnings.
-    /// @param minRewardTokensCncAmount Minimum amount of CNC that should be received
     /// after selling all extra reward tokens.
-    function claimEarnings(uint256 minRewardTokensCncAmount)
+    function claimEarnings()
         public
         override
         returns (
@@ -209,8 +224,7 @@ contract RewardManager is IRewardManager, Ownable {
             cvxAmount > CVX.balanceOf(pool) ||
             cncAmount > CNC.balanceOf(pool)
         ) {
-            claimPoolEarningsAndSellRewardTokens(minRewardTokensCncAmount);
-            lpTokenStaker.claimCNCRewardsForPool(pool);
+            _claimPoolEarningsAndSellRewardTokens();
         }
         _rewardsMeta[_CNC_KEY].accountShare[msg.sender] = 0;
         _rewardsMeta[_CVX_KEY].accountShare[msg.sender] = 0;
@@ -221,6 +235,7 @@ contract RewardManager is IRewardManager, Ownable {
         CNC.safeTransferFrom(pool, msg.sender, cncAmount);
 
         _oldCrvBalance = CRV.balanceOf(pool);
+        _oldCvxBalance = CVX.balanceOf(pool);
 
         emit EarningsClaimed(msg.sender, cncAmount, crvAmount, cvxAmount);
         return (cncAmount, crvAmount, cvxAmount);
@@ -228,16 +243,36 @@ contract RewardManager is IRewardManager, Ownable {
 
     /// @notice Claims all claimable CVX and CRV from Convex for all staked Curve LP tokens.
     /// Then Swaps all additional rewards tokens for CNC.
-    function claimPoolEarningsAndSellRewardTokens(uint256 minRewardTokensCncAmount)
-        public
-        override
-    {
+    function claimPoolEarningsAndSellRewardTokens() external override {
+        if (!poolCheckpoint()) {
+            _claimPoolEarningsAndSellRewardTokens();
+            _oldCrvBalance = CRV.balanceOf(pool);
+            _oldCvxBalance = CVX.balanceOf(pool);
+        }
+    }
+
+    function _claimPoolEarningsAndSellRewardTokens() internal {
+        _rewardsMeta[_CRV_KEY].lastEarned = 0;
+        _rewardsMeta[_CVX_KEY].lastEarned = 0;
+        _rewardsMeta[_CNC_KEY].lastEarned = 0;
+
         _claimPoolEarnings();
-        _sellRewardTokens(minRewardTokensCncAmount);
+
+        uint256 cncBalanceBefore_ = CNC.balanceOf(pool);
+
+        _sellRewardTokens();
+
+        uint256 receivedCnc_ = CNC.balanceOf(pool) - cncBalanceBefore_;
+        uint256 _totalStaked = lpTokenStaker.getBalanceForPool(pool);
+        if (_totalStaked > 0)
+            _rewardsMeta[_CNC_KEY].earnedIntegral += receivedCnc_.divDown(_totalStaked);
+        emit SoldRewardTokens(receivedCnc_);
     }
 
     /// @notice Claims all claimable CVX and CRV from Convex for all staked Curve LP tokens
     function _claimPoolEarnings() internal {
+        lpTokenStaker.claimCNCRewardsForPool(pool);
+
         uint256 cvxBalance = CVX.balanceOf(pool);
         uint256 crvBalance = CRV.balanceOf(pool);
 
@@ -248,26 +283,17 @@ contract RewardManager is IRewardManager, Ownable {
         uint256 claimedCvx = CVX.balanceOf(pool) - cvxBalance;
         uint256 claimedCrv = CRV.balanceOf(pool) - crvBalance;
 
-        totalCRVClaimed += claimedCrv;
         emit ClaimedRewards(claimedCrv, claimedCvx);
     }
 
     /// @notice Swaps all additional rewards tokens for CNC.
-    function _sellRewardTokens(uint256 minCncAmount) internal {
+    function _sellRewardTokens() internal {
         uint256 extraRewardsLength_ = _extraRewards.length();
         if (extraRewardsLength_ == 0) return;
-        uint256 cncBalanceBefore_ = CNC.balanceOf(pool);
         for (uint256 i; i < extraRewardsLength_; i++) {
             _swapRewardTokenForWeth(_extraRewards.at(i));
         }
         _swapWethForCNC();
-
-        uint256 received_ = CNC.balanceOf(pool) - cncBalanceBefore_;
-        require(received_ >= minCncAmount, "received less than minCncAmount");
-
-        uint256 _totalStaked = lpTokenStaker.getBalanceForPool(pool);
-        if (_totalStaked > 0) _updateEarned(_CNC_KEY, received_, _totalStaked);
-        emit SoldRewardTokens(received_);
     }
 
     function listExtraRewards() external view returns (address[] memory) {
@@ -277,7 +303,10 @@ contract RewardManager is IRewardManager, Ownable {
     function addExtraReward(address reward) public override onlyOwner returns (bool) {
         require(reward != address(0), "invalid address");
         require(
-            reward != address(CVX) && reward != address(CRV) && reward != address(underlying),
+            reward != address(CVX) &&
+                reward != address(CRV) &&
+                reward != address(underlying) &&
+                reward != address(CNC),
             "token not allowed"
         );
 
@@ -374,11 +403,9 @@ contract RewardManager is IRewardManager, Ownable {
         RewardMeta storage meta = _rewardsMeta[key];
         uint256 integral = meta.earnedIntegral;
         if (deductFee) {
-            integral += (earned - meta.lastEarned).divDown(_totalSupply).mulDown(
-                ScaledMath.ONE - feePercentage
-            );
+            integral += earned.divDown(_totalSupply).mulDown(ScaledMath.ONE - feePercentage);
         } else {
-            integral += (earned - meta.lastEarned).divDown(_totalSupply);
+            integral += earned.divDown(_totalSupply);
         }
         return
             meta.accountShare[account] +
@@ -397,19 +424,68 @@ contract RewardManager is IRewardManager, Ownable {
                 address(WETH)
             );
             (uint256 from_, uint256 to_) = (uint256(uint128(i)), uint256(uint128(j)));
-            curvePool_.exchange(from_, to_, tokenBalance_, 0, false, address(this));
+            curvePool_.exchange(
+                from_,
+                to_,
+                tokenBalance_,
+                _minAmountOut(address(rewardToken_), address(WETH), tokenBalance_),
+                false,
+                address(this)
+            );
             return;
         }
 
         address[] memory path_ = new address[](2);
         path_[0] = rewardToken_;
         path_[1] = address(WETH);
-        SUSHISWAP.swapExactTokensForTokens(tokenBalance_, 0, path_, address(this), block.timestamp);
+        SUSHISWAP.swapExactTokensForTokens(
+            tokenBalance_,
+            _minAmountOut(address(rewardToken_), address(WETH), tokenBalance_),
+            path_,
+            address(this),
+            block.timestamp
+        );
     }
 
     function _swapWethForCNC() internal {
         uint256 wethBalance_ = WETH.balanceOf(address(this));
         if (wethBalance_ == 0) return;
-        CNC_ETH_POOL.exchange(0, 1, wethBalance_, 0, false, pool);
+        CNC_ETH_POOL.exchange(
+            0,
+            1,
+            wethBalance_,
+            _minAmountOut(address(WETH), address(CNC), wethBalance_),
+            false,
+            pool
+        );
+    }
+
+    function _minAmountOut(
+        address tokenIn_,
+        address tokenOut_,
+        uint256 amountIn_
+    ) internal view returns (uint256) {
+        IOracle oracle_ = controller.priceOracle();
+
+        if (tokenIn_ == tokenOut_) {
+            return amountIn_;
+        }
+
+        // If we don't have a price for either token, we can't calculate the min amount out
+        // This should only ever happen for very minor tokens, so we accept the risk of not having
+        // slippage protection in that case
+        if (!oracle_.isTokenSupported(tokenIn_) || !oracle_.isTokenSupported(tokenOut_)) {
+            return 0;
+        }
+
+        return
+            amountIn_
+                .mulDown(oracle_.getUSDPrice(tokenIn_))
+                .divDown(oracle_.getUSDPrice(tokenOut_))
+                .convertScale(
+                    IERC20Metadata(tokenIn_).decimals(),
+                    IERC20Metadata(tokenOut_).decimals()
+                )
+                .mulDown(SLIPPAGE_THRESHOLD);
     }
 }

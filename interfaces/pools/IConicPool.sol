@@ -47,6 +47,8 @@ interface IConicPool {
 
     function exchangeRate() external view returns (uint256);
 
+    function usdExchangeRate() external view returns (uint256);
+
     function allCurvePools() external view returns (address[] memory);
 
     function withdraw(uint256 _amount, uint256 _minAmount) external returns (uint256);

@@ -20,7 +20,8 @@ contract CurveRegistryCache is ICurveRegistryCache, Ownable {
 
     mapping(address => bool) internal _isRegistered;
     mapping(address => address) internal _lpToken;
-    mapping(address => mapping(address => bool)) internal _hasCoin;
+    mapping(address => mapping(address => bool)) internal _hasCoinDirectly;
+    mapping(address => mapping(address => bool)) internal _hasCoinAnywhere;
     mapping(address => address) internal _basePool;
     mapping(address => mapping(address => int128)) internal _coinIndex;
     mapping(address => uint256) internal _nCoins;
@@ -58,18 +59,27 @@ contract CurveRegistryCache is ICurveRegistryCache, Ownable {
             _setConvexPid(pool_, curveLpToken);
         }
         _poolFromLpToken[_lpToken[pool_]] = pool_;
-        _basePool[pool_] = _CURVE_REGISTRY.get_base_pool(pool_);
+        address basePool_ = _CURVE_REGISTRY.get_base_pool(pool_);
+        _basePool[pool_] = basePool_;
+        if (basePool_ != address(0)) {
+            _initPool(basePool_, false, 0);
+            address[] memory basePoolCoins_ = _coins[basePool_];
+            for (uint256 i; i < basePoolCoins_.length; i++) {
+                address coin_ = basePoolCoins_[i];
+                _hasCoinAnywhere[pool_][coin_] = true;
+            }
+        }
         _assetType[pool_] = _CURVE_REGISTRY.get_pool_asset_type(pool_);
         uint256 nCoins_ = _CURVE_REGISTRY.get_n_coins(pool_);
         address[8] memory staticCoins_ = _CURVE_REGISTRY.get_coins(pool_);
         uint256[8] memory staticDecimals_ = _CURVE_REGISTRY.get_decimals(pool_);
         address[] memory coins_ = new address[](nCoins_);
-
-        for (uint256 i; i < staticCoins_.length; i++) {
+        for (uint256 i; i < nCoins_; i++) {
             address coin_ = staticCoins_[i];
-            if (coin_ == address(0)) continue;
+            require(coin_ != address(0), "CurveRegistryCache: invalid coin");
             coins_[i] = coin_;
-            _hasCoin[pool_][coin_] = true;
+            _hasCoinDirectly[pool_][coin_] = true;
+            _hasCoinAnywhere[pool_][coin_] = true;
             _coinIndex[pool_][coin_] = int128(uint128(i));
             _decimals[pool_].push(staticDecimals_[i]);
         }
@@ -130,14 +140,24 @@ contract CurveRegistryCache is ICurveRegistryCache, Ownable {
         return _assetType[pool_];
     }
 
-    function hasCoin(address pool_, address coin_)
+    function hasCoinDirectly(address pool_, address coin_)
         external
         view
         override
         onlyInitialized(pool_)
         returns (bool)
     {
-        return _hasCoin[pool_][coin_];
+        return _hasCoinDirectly[pool_][coin_];
+    }
+
+    function hasCoinAnywhere(address pool_, address coin_)
+        external
+        view
+        override
+        onlyInitialized(pool_)
+        returns (bool)
+    {
+        return _hasCoinAnywhere[pool_][coin_];
     }
 
     function basePool(address pool_)
@@ -182,7 +202,7 @@ contract CurveRegistryCache is ICurveRegistryCache, Ownable {
         return (
             _coinIndex[pool_][from_],
             _coinIndex[pool_][to_],
-            _hasCoin[pool_][from_] && _hasCoin[pool_][to_]
+            _hasCoinDirectly[pool_][from_] && _hasCoinDirectly[pool_][to_]
         );
     }
 

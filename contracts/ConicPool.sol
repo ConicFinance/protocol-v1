@@ -13,6 +13,7 @@ import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "../interfaces/pools/IConicPool.sol";
 import "../interfaces/pools/IRewardManager.sol";
 import "../interfaces/ICurveHandler.sol";
+import "../interfaces/ICurveRegistryCache.sol";
 import "../interfaces/tokenomics/IInflationManager.sol";
 import "../interfaces/tokenomics/ILpTokenStaker.sol";
 import "../interfaces/IConvexHandler.sol";
@@ -31,6 +32,7 @@ contract ConicPool is IConicPool, Ownable {
     using EnumerableSet for EnumerableSet.AddressSet;
     using EnumerableMap for EnumerableMap.AddressToUintMap;
     using SafeERC20 for IERC20;
+    using SafeERC20 for IERC20Metadata;
     using SafeERC20 for ILpToken;
     using ScaledMath for uint256;
     using Address for address;
@@ -52,6 +54,7 @@ contract ConicPool is IConicPool, Ownable {
     uint256 internal constant _MAX_DEPEG_THRESHOLD = 0.1e18;
     uint256 internal constant _DEPEG_UNDERLYING_MULTIPLIER = 2;
     uint256 internal constant _TOTAL_UNDERLYING_CACHE_EXPIRY = 3 days;
+    uint256 internal constant _MAX_USD_LP_VALUE_FOR_REMOVING_CURVE_POOL = 100e18;
 
     IERC20 public immutable CVX;
     IERC20 public immutable CRV;
@@ -98,6 +101,10 @@ contract ConicPool is IConicPool, Ownable {
         address _crv,
         address _lpTokenStaker
     ) {
+        require(
+            _underlying != _cvx && _underlying != _crv && _underlying != address(CNC),
+            "invalid underlying"
+        );
         underlying = IERC20Metadata(_underlying);
         controller = IController(_controller);
         uint8 decimals = IERC20Metadata(_underlying).decimals();
@@ -146,22 +153,23 @@ contract ConicPool is IConicPool, Ownable {
         require(underlyingAmount > 0, "deposit amount cannot be zero");
         (
             uint256 underlyingBalanceBefore_,
+            uint256 allocatedBalanceBefore_,
             uint256[] memory allocatedPerPoolBefore
         ) = _getTotalAndPerPoolUnderlying();
         vars.exchangeRate_ = _exchangeRate(underlyingBalanceBefore_);
 
         // Executing deposit
-        IERC20 underlying_ = underlying;
-        underlying_.safeTransferFrom(msg.sender, address(this), underlyingAmount);
+        underlying.safeTransferFrom(msg.sender, address(this), underlyingAmount);
         _depositToCurve(
-            underlyingBalanceBefore_,
+            allocatedBalanceBefore_,
             allocatedPerPoolBefore,
-            underlying_.balanceOf(address(this))
+            underlying.balanceOf(address(this))
         );
 
         // Minting LP Tokens
         (
             uint256 underlyingBalanceAfter_,
+            uint256 allocatedBalanceAfter_,
             uint256[] memory allocatedPerPoolAfter
         ) = _getTotalAndPerPoolUnderlying();
         vars.underlyingBalanceIncrease_ = underlyingBalanceAfter_ - underlyingBalanceBefore_;
@@ -176,15 +184,13 @@ contract ConicPool is IConicPool, Ownable {
             lpToken.mint(account, vars.lpReceived);
         }
 
-        if (rebalancingRewardActive) {
-            _handleRebalancingRewards(
-                account,
-                underlyingBalanceBefore_,
-                allocatedPerPoolBefore,
-                underlyingBalanceAfter_,
-                allocatedPerPoolAfter
-            );
-        }
+        _handleRebalancingRewards(
+            account,
+            allocatedBalanceBefore_,
+            allocatedPerPoolBefore,
+            allocatedBalanceAfter_,
+            allocatedPerPoolAfter
+        );
 
         _cachedTotalUnderlying = underlyingBalanceAfter_;
         _cacheUpdatedTimestamp = block.timestamp;
@@ -289,7 +295,7 @@ contract ConicPool is IConicPool, Ownable {
 
     /// @notice Get current underlying balance of pool
     function totalUnderlying() public view virtual returns (uint256) {
-        (uint256 totalUnderlying_, ) = _getTotalAndPerPoolUnderlying();
+        (uint256 totalUnderlying_, , ) = _getTotalAndPerPoolUnderlying();
 
         return totalUnderlying_;
     }
@@ -304,6 +310,11 @@ contract ConicPool is IConicPool, Ownable {
     /// @notice Get current exchange rate for the pool's LP token
     function exchangeRate() public view virtual override returns (uint256) {
         return _exchangeRate(totalUnderlying());
+    }
+
+    function usdExchangeRate() external view virtual override returns (uint256) {
+        uint256 underlyingPrice = controller.priceOracle().getUSDPrice(address(underlying));
+        return exchangeRate().mulDown(underlyingPrice);
     }
 
     /// @notice Withdraw underlying
@@ -327,21 +338,27 @@ contract ConicPool is IConicPool, Ownable {
         // Processing Withdrawals
         (
             uint256 totalUnderlying_,
+            uint256 allocatedUnderlying_,
             uint256[] memory allocatedPerPool
         ) = _getTotalAndPerPoolUnderlying();
         uint256 underlyingToReceive_ = conicLpAmount.mulDown(_exchangeRate(totalUnderlying_));
-        uint256 underlyingToWithdraw_ = underlyingToReceive_ - underlyingBalanceBefore_;
-        _withdrawFromCurve(totalUnderlying_, allocatedPerPool, underlyingToWithdraw_);
+        {
+            if (underlyingBalanceBefore_ < underlyingToReceive_) {
+                uint256 underlyingToWithdraw_ = underlyingToReceive_ - underlyingBalanceBefore_;
+                _withdrawFromCurve(allocatedUnderlying_, allocatedPerPool, underlyingToWithdraw_);
+            }
+        }
 
         // Sending Underlying and burning LP Tokens
-        uint256 underlyingBalanceAfter_ = underlying_.balanceOf(address(this));
-        uint256 underlyingBalanceDiff_ = underlyingBalanceAfter_ - underlyingBalanceBefore_;
-        uint256 underlyingWithdrawn_ = _min(underlyingBalanceDiff_, underlyingToReceive_);
+        uint256 underlyingWithdrawn_ = _min(
+            underlying_.balanceOf(address(this)),
+            underlyingToReceive_
+        );
         require(underlyingWithdrawn_ >= minUnderlyingReceived, "too much slippage");
         lpToken_.burn(msg.sender, conicLpAmount);
         underlying_.safeTransfer(msg.sender, underlyingWithdrawn_);
 
-        _cachedTotalUnderlying = underlyingBalanceAfter_;
+        _cachedTotalUnderlying = totalUnderlying_ - underlyingWithdrawn_;
         _cacheUpdatedTimestamp = block.timestamp;
 
         emit Withdraw(msg.sender, underlyingWithdrawn_);
@@ -400,13 +417,16 @@ contract ConicPool is IConicPool, Ownable {
         address curveLpToken_ = controller.curveRegistryCache().lpToken(curvePool_);
         uint256 lpToWithdraw_ = _underlyingToCurveLp(curveLpToken_, underlyingAmount_);
 
-        controller.convexHandler().functionDelegateCall(
-            abi.encodeWithSignature(
-                "withdraw(address,uint256)",
-                curvePool_,
-                lpToWithdraw_ - _idleCurveLpBalance(curvePool_)
-            )
-        );
+        uint256 idleCurveLpBalance_ = _idleCurveLpBalance(curvePool_);
+        if (lpToWithdraw_ > idleCurveLpBalance_) {
+            controller.convexHandler().functionDelegateCall(
+                abi.encodeWithSignature(
+                    "withdraw(address,uint256)",
+                    curvePool_,
+                    lpToWithdraw_ - idleCurveLpBalance_
+                )
+            );
+        }
 
         controller.curveHandler().functionDelegateCall(
             abi.encodeWithSignature(
@@ -439,8 +459,11 @@ contract ConicPool is IConicPool, Ownable {
 
     function addCurvePool(address _pool) external override onlyOwner {
         require(!_curvePools.contains(_pool), "pool already added");
-        controller.curveRegistryCache().initPool(_pool);
-        address curveLpToken = controller.curveRegistryCache().lpToken(_pool);
+        ICurveRegistryCache curveRegistryCache_ = controller.curveRegistryCache();
+        curveRegistryCache_.initPool(_pool);
+        bool supported_ = curveRegistryCache_.hasCoinAnywhere(_pool, address(underlying));
+        require(supported_, "coin not in pool");
+        address curveLpToken = curveRegistryCache_.lpToken(_pool);
         require(controller.priceOracle().isTokenSupported(curveLpToken), "cannot price LP Token");
 
         address booster = controller.convexBooster();
@@ -453,7 +476,10 @@ contract ConicPool is IConicPool, Ownable {
     function removeCurvePool(address _pool) external override onlyOwner {
         require(_curvePools.contains(_pool), "pool not added");
         require(_curvePools.length() > 1, "cannot remove last pool");
-        require(_totalCurveLpBalance(_pool) == 0, "pool has allocated funds");
+        address curveLpToken = controller.curveRegistryCache().lpToken(_pool);
+        uint256 lpTokenPrice = controller.priceOracle().getUSDPrice(curveLpToken);
+        uint256 usdLpValue = _totalCurveLpBalance(_pool).mulDown(lpTokenPrice);
+        require(usdLpValue < _MAX_USD_LP_VALUE_FOR_REMOVING_CURVE_POOL, "pool has allocated funds");
         uint256 weight = weights.get(_pool);
         require(weight == 0, "pool has weight set");
         require(_curvePools.remove(_pool), "pool not removed");
@@ -461,6 +487,7 @@ contract ConicPool is IConicPool, Ownable {
     }
 
     function updateWeights(PoolWeight[] memory poolWeights) external onlyController {
+        require(poolWeights.length == _curvePools.length(), "invalid pool weights");
         uint256 total;
         for (uint256 i; i < poolWeights.length; i++) {
             address pool = poolWeights[i].poolAddress;
@@ -475,6 +502,8 @@ contract ConicPool is IConicPool, Ownable {
 
         (
             uint256 totalUnderlying_,
+            ,
+            /* uint256 allocatedUnderlying_ */
             uint256[] memory allocatedPerPool
         ) = _getTotalAndPerPoolUnderlying();
 
@@ -544,6 +573,8 @@ contract ConicPool is IConicPool, Ownable {
         // Updating total deviation
         (
             uint256 totalUnderlying_,
+            ,
+            /* uint256 allocatedUnderlying_ */
             uint256[] memory allocatedPerPool
         ) = _getTotalAndPerPoolUnderlying();
         uint256 totalDeviation = _computeTotalDeviation(totalUnderlying_, allocatedPerPool);
@@ -596,7 +627,7 @@ contract ConicPool is IConicPool, Ownable {
 
     function getAllocatedUnderlying() external view override returns (PoolWithAmount[] memory) {
         PoolWithAmount[] memory perPoolAllocated = new PoolWithAmount[](_curvePools.length());
-        (, uint256[] memory allocated) = _getTotalAndPerPoolUnderlying();
+        (, , uint256[] memory allocated) = _getTotalAndPerPoolUnderlying();
 
         for (uint256 i = 0; i < perPoolAllocated.length; i++) {
             perPoolAllocated[i] = PoolWithAmount(_curvePools.at(i), allocated[i]);
@@ -606,19 +637,21 @@ contract ConicPool is IConicPool, Ownable {
 
     function computeTotalDeviation() external view override returns (uint256) {
         (
-            uint256 totalUnderlying_,
+            ,
+            uint256 allocatedUnderlying_,
             uint256[] memory perPoolUnderlying
         ) = _getTotalAndPerPoolUnderlying();
-        return _computeTotalDeviation(totalUnderlying_, perPoolUnderlying);
+        return _computeTotalDeviation(allocatedUnderlying_, perPoolUnderlying);
     }
 
     function computeDeviationRatio() external view returns (uint256) {
         (
-            uint256 totalUnderlying_,
+            ,
+            uint256 allocatedUnderlying_,
             uint256[] memory perPoolUnderlying
         ) = _getTotalAndPerPoolUnderlying();
-        uint256 deviation = _computeTotalDeviation(totalUnderlying_, perPoolUnderlying);
-        return deviation.divDown(totalUnderlying_);
+        uint256 deviation = _computeTotalDeviation(allocatedUnderlying_, perPoolUnderlying);
+        return deviation.divDown(allocatedUnderlying_);
     }
 
     function cachedTotalUnderlying() external view virtual override returns (uint256) {
@@ -628,9 +661,22 @@ contract ConicPool is IConicPool, Ownable {
         return _cachedTotalUnderlying;
     }
 
-    function _getTotalAndPerPoolUnderlying() internal view returns (uint256, uint256[] memory) {
-        uint256 totalUnderlying_ = underlying.balanceOf(address(this));
-        uint256[] memory perPoolUnderlying_ = new uint256[](_curvePools.length());
+    /**
+     * @notice Returns several values related to the Omnipools's underlying assets.
+     * @return totalUnderlying_ Total underlying value of the Omnipool
+     * @return totalAllocated_ Total underlying value of the Omnipool that is allocated to Curve pools
+     * @return perPoolUnderlying_ Array of underlying values of the Omnipool that is allocated to each Curve pool
+     */
+    function _getTotalAndPerPoolUnderlying()
+        internal
+        view
+        returns (
+            uint256 totalUnderlying_,
+            uint256 totalAllocated_,
+            uint256[] memory perPoolUnderlying_
+        )
+    {
+        perPoolUnderlying_ = new uint256[](_curvePools.length());
         for (uint256 i; i < _curvePools.length(); i++) {
             address curvePool_ = _curvePools.at(i);
             uint256 poolUnderlying_ = _curveLpToUnderlying(
@@ -638,9 +684,9 @@ contract ConicPool is IConicPool, Ownable {
                 _totalCurveLpBalance(curvePool_)
             );
             perPoolUnderlying_[i] = poolUnderlying_;
-            totalUnderlying_ += poolUnderlying_;
+            totalAllocated_ += poolUnderlying_;
         }
-        return (totalUnderlying_, perPoolUnderlying_);
+        totalUnderlying_ = totalAllocated_ + underlying.balanceOf(address(this));
     }
 
     function _stakedCurveLpBalance(address pool_) internal view returns (uint256) {
@@ -702,6 +748,7 @@ contract ConicPool is IConicPool, Ownable {
         uint256 underlyingBalanceAfter_,
         uint256[] memory allocatedPerPoolAfter
     ) internal {
+        if (!rebalancingRewardActive) return;
         uint256 deviationBefore = _computeTotalDeviation(
             underlyingBalanceBefore_,
             allocatedPerPoolBefore

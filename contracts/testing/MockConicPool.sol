@@ -85,6 +85,10 @@ contract MockConicPool is ConicPool {
         return 1e18;
     }
 
+    function usdExchangeRate() external view override returns (uint256) {
+        return 1e18;
+    }
+
     function updateTotalUnderlying(uint256 amount) public {
         _useFakeTotalUnderlying = true;
         _fakeTotalUnderlying = amount;
@@ -102,7 +106,7 @@ contract MockConicPool is ConicPool {
 
     function totalUnderlying() public view override returns (uint256) {
         if (!_useFakeTotalUnderlying) {
-            (uint256 totalUnderlying_, ) = _getTotalAndPerPoolUnderlying();
+            (uint256 totalUnderlying_, , ) = _getTotalAndPerPoolUnderlying();
 
             return totalUnderlying_;
         }

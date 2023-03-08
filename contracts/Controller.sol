@@ -23,7 +23,7 @@ contract Controller is IController, Ownable {
     IOracle public override priceOracle;
 
     IInflationManager public override inflationManager;
-    ILpTokenStaker public lpTokenStaker;
+    ILpTokenStaker public override lpTokenStaker;
 
     uint256 public weightUpdateMinDelay;
 
@@ -79,22 +79,27 @@ contract Controller is IController, Ownable {
 
     function setConvexBooster(address _convexBooster) external override onlyOwner {
         convexBooster = _convexBooster;
+        emit ConvexBoosterSet(_convexBooster);
     }
 
     function setCurveHandler(address _curveHandler) external override onlyOwner {
         curveHandler = _curveHandler;
+        emit CurveHandlerSet(_curveHandler);
     }
 
     function setConvexHandler(address _convexHandler) external override onlyOwner {
         convexHandler = _convexHandler;
+        emit ConvexHandlerSet(_convexHandler);
     }
 
     function setInflationManager(address manager) external onlyOwner {
         inflationManager = IInflationManager(manager);
+        emit InflationManagerSet(manager);
     }
 
     function setPriceOracle(address oracle) external override onlyOwner {
         priceOracle = IOracle(oracle);
+        emit PriceOracleSet(oracle);
     }
 
     function setWeightUpdateMinDelay(uint256 delay) external onlyOwner {

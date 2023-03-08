@@ -27,4 +27,6 @@ interface IBooster {
     function withdrawAll(uint256 _pid) external returns (bool);
 
     function depositAll(uint256 _pid, bool _stake) external returns (bool);
+
+    function earmarkRewards(uint256 _pid) external returns (bool);
 }

@@ -57,12 +57,15 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         address account
     ) public override {
         require(controller.isPool(conicPool), "not a conic pool");
-        uint256 exchangeRate = IConicPool(conicPool).exchangeRate();
+        ILpToken lpToken = IConicPool(conicPool).lpToken();
+        uint256 exchangeRate = IConicPool(conicPool).usdExchangeRate();
         // Checkpoint all inflation logic
         IConicPool(conicPool).rewardManager().accountCheckpoint(account);
-        _stakerCheckpoint(account, amount.mulDown(exchangeRate));
+        _stakerCheckpoint(
+            account,
+            amount.convertScale(lpToken.decimals(), 18).mulDown(exchangeRate)
+        );
         // Actual staking
-        ILpToken lpToken = IConicPool(conicPool).lpToken();
         lpToken.safeTransferFrom(msg.sender, address(this), amount);
         stakedPerUser[account][conicPool] += amount;
         stakedPerPool[conicPool] += amount;
@@ -76,7 +79,7 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         require(controller.isPool(conicPool), "not a conic pool");
         require(stakedPerUser[msg.sender][conicPool] >= amount, "not enough staked");
         // Checkpoint all inflation logic
-        IConicPool(conicPool).rewardManager().accountCheckpoint(account);
+        IConicPool(conicPool).rewardManager().accountCheckpoint(msg.sender);
         _stakerCheckpoint(msg.sender, 0);
         // Actual unstaking
         ILpToken lpToken = IConicPool(conicPool).lpToken();
@@ -103,7 +106,9 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
     }
 
     function getTimeToFullBoost(address user) external view returns (uint256) {
-        return (ScaledMath.ONE - boosts[user].timeBoost).mulDown(INCREASE_PERIOD);
+        uint256 fullBoostAt_ = boosts[user].lastUpdated + INCREASE_PERIOD;
+        if (fullBoostAt_ <= block.timestamp) return 0;
+        return fullBoostAt_ - block.timestamp;
     }
 
     function getBoost(address user) external view override returns (uint256) {
@@ -210,23 +215,36 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         userBoost.lastUpdated = block.timestamp;
     }
 
+    function _getUserUSDStakedInPool(address account, address pool)
+        internal
+        view
+        returns (uint256 poolStaked, uint256 poolUserStaked)
+    {
+        uint256 curExchangeRate = IConicPool(pool).usdExchangeRate();
+
+        uint8 decimals = IConicPool(pool).lpToken().decimals();
+        poolStaked = stakedPerPool[pool].convertScale(decimals, 18).mulDown(curExchangeRate);
+        poolUserStaked = stakedPerUser[account][pool].convertScale(decimals, 18).mulDown(
+            curExchangeRate
+        );
+    }
+
     function _getTotalStakedForUserCommonDenomination(address account)
         public
         view
         returns (uint256, uint256)
     {
         address[] memory conicPools = controller.listPools();
-        uint256 numPools = conicPools.length;
-        uint256 totalStaked = 0;
-        uint256 userStaked = 0;
-        address curPool;
-        uint256 curExchangeRate;
-        for (uint256 i = 0; i < numPools; i++) {
-            curPool = conicPools[i];
-            curExchangeRate = IConicPool(curPool).exchangeRate();
-            totalStaked += stakedPerPool[curPool].mulDown(curExchangeRate);
-            userStaked += stakedPerUser[account][curPool].mulDown(curExchangeRate);
+        uint256 totalStakedUSD = 0;
+        uint256 userStakedUSD = 0;
+        for (uint256 i; i < conicPools.length; i++) {
+            (uint256 poolStakedUSD, uint256 poolUserStakedUSD) = _getUserUSDStakedInPool(
+                account,
+                conicPools[i]
+            );
+            totalStakedUSD += poolStakedUSD;
+            userStakedUSD += poolUserStakedUSD;
         }
-        return (userStaked, totalStaked);
+        return (userStakedUSD, totalStakedUSD);
     }
 }

@@ -12,7 +12,9 @@ interface ICurveRegistryCache {
 
     function isRegistered(address pool_) external view returns (bool);
 
-    function hasCoin(address pool_, address coin_) external view returns (bool);
+    function hasCoinDirectly(address pool_, address coin_) external view returns (bool);
+
+    function hasCoinAnywhere(address pool_, address coin_) external view returns (bool);
 
     function basePool(address pool_) external view returns (address);
 

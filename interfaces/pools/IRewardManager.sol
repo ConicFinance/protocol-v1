@@ -25,15 +25,13 @@ interface IRewardManager {
 
     function accountCheckpoint(address account) external;
 
-    function poolCheckpoint() external;
+    function poolCheckpoint() external returns (bool);
 
     function addExtraReward(address reward) external returns (bool);
 
     function addBatchExtraRewards(address[] memory rewards) external;
 
     function pool() external view returns (address);
-
-    function totalCRVClaimed() external view returns (uint256);
 
     function setFeePercentage(uint256 _feePercentage) external;
 
@@ -54,13 +52,5 @@ interface IRewardManager {
             uint256
         );
 
-    function claimEarnings(uint256 minRewardTokensCncAmount)
-        external
-        returns (
-            uint256,
-            uint256,
-            uint256
-        );
-
-    function claimPoolEarningsAndSellRewardTokens(uint256 minRewardTokensCncAmount) external;
+    function claimPoolEarningsAndSellRewardTokens() external;
 }

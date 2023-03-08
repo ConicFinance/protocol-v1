@@ -181,6 +181,7 @@ contract CurveHandler is ICurveHandler {
 
     function _isETH(address pool, address token) internal view returns (bool) {
         return
-            token == address(_WETH) && controller.curveRegistryCache().hasCoin(pool, _ETH_ADDRESS);
+            token == address(_WETH) &&
+            controller.curveRegistryCache().hasCoinDirectly(pool, _ETH_ADDRESS);
     }
 }
