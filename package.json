@@ -1,0 +1,10 @@
+{
+  "devDependencies": {
+    "@chainlink/contracts": "^0.5.0",
+    "@openzeppelin/contracts": "^4.8.0",
+    "hardhat": "^2.9.3"
+  },
+  "prettier": {
+    "printWidth": 100
+  }
+}
