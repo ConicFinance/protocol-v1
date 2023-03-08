@@ -12,7 +12,11 @@ interface ICNCToken is IERC20 {
     event TreasuryRewardsMinted(uint256 amount);
     event SeedShareMinted(uint256 amount);
 
+    /// @notice adds a new minter
     function addMinter(address newMinter) external;
+
+    /// @notice renounces the minter rights of the sender
+    function renounceMinterRights() external;
 
     /// @notice mints the initial distribution amount to the distribution contract
     function mintInitialDistribution(address distribution) external;

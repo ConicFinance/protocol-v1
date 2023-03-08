@@ -19,9 +19,9 @@ contract InflationManager is IInflationManager, Ownable {
 
     ICNCToken public constant CNC = ICNCToken(0x9aE380F0272E2162340a5bB646c354271c0F5cFC);
 
-    IController public controller;
+    IController public immutable controller;
 
-    uint256 internal constant _INITIAL_INFLATION_RATE = 1_800_000 * 1e18;
+    uint256 internal constant _INITIAL_INFLATION_RATE = 1_500_000 * 1e18;
     uint256 internal constant _INFLATION_RATE_DECAY = 0.3999999 * 1e18;
     uint256 internal constant _INFLATION_RATE_PERIOD = 365 days;
 
@@ -45,7 +45,7 @@ contract InflationManager is IInflationManager, Ownable {
     }
 
     /// @notice returns the weights of the Conic pools to know how much inflation
-    /// each of them will receive
+    /// each of them will receive. totalUSDValue only accounts for funds in active pools
     function computePoolWeights()
         public
         view
@@ -60,15 +60,17 @@ contract InflationManager is IInflationManager, Ownable {
         pools = controller.listPools();
         uint256[] memory poolUSDValues = new uint256[](pools.length);
         for (uint256 i; i < pools.length; i++) {
-            IConicPool pool = IConicPool(pools[i]);
-            IERC20Metadata underlying = pool.underlying();
-            uint256 price = oracle.getUSDPrice(address(underlying));
-            uint256 poolUSDValue = pool
-                .cachedTotalUnderlying()
-                .convertScale(underlying.decimals(), 18)
-                .mulDown(price);
-            poolUSDValues[i] = poolUSDValue;
-            totalUSDValue += poolUSDValue;
+            if (controller.isActivePool(pools[i])) {
+                IConicPool pool = IConicPool(pools[i]);
+                IERC20Metadata underlying = pool.underlying();
+                uint256 price = oracle.getUSDPrice(address(underlying));
+                uint256 poolUSDValue = pool
+                    .cachedTotalUnderlying()
+                    .convertScale(underlying.decimals(), 18)
+                    .mulDown(price);
+                poolUSDValues[i] = poolUSDValue;
+                totalUSDValue += poolUSDValue;
+            }
         }
 
         poolWeights = new uint256[](pools.length);
@@ -85,6 +87,7 @@ contract InflationManager is IInflationManager, Ownable {
     }
 
     /// @notice Same as `computePoolWeights` but only returns the value for a single pool
+    /// totalUSDValue only accounts for funds in active pools
     function computePoolWeight(address pool)
         public
         view
@@ -95,17 +98,22 @@ contract InflationManager is IInflationManager, Ownable {
         address[] memory pools = controller.listPools();
         uint256 poolUSDValue;
         for (uint256 i; i < pools.length; i++) {
-            IConicPool currentPool = IConicPool(pools[i]);
-            IERC20Metadata underlying = currentPool.underlying();
-            uint256 price = oracle.getUSDPrice(address(underlying));
-            uint256 usdValue = currentPool
-                .cachedTotalUnderlying()
-                .convertScale(underlying.decimals(), 18)
-                .mulDown(price);
-            totalUSDValue += usdValue;
-            if (address(currentPool) == pool) poolUSDValue = usdValue;
+            if (controller.isActivePool(pools[i])) {
+                IConicPool currentPool = IConicPool(pools[i]);
+                IERC20Metadata underlying = currentPool.underlying();
+                uint256 price = oracle.getUSDPrice(address(underlying));
+                uint256 usdValue = currentPool
+                    .cachedTotalUnderlying()
+                    .convertScale(underlying.decimals(), 18)
+                    .mulDown(price);
+                totalUSDValue += usdValue;
+                if (address(currentPool) == pool) poolUSDValue = usdValue;
+            }
         }
 
+        if (!controller.isActivePool(pool)) {
+            return (0, totalUSDValue);
+        }
         poolWeight = totalUSDValue == 0
             ? ScaledMath.ONE / pools.length
             : poolUSDValue.divDown(totalUSDValue);
@@ -121,7 +129,7 @@ contract InflationManager is IInflationManager, Ownable {
         uint256 deviationAfter
     ) external {
         require(controller.isPool(msg.sender), "only pools can call this function");
-        for (uint256 i = 0; i < _rebalancingRewardHandlers[msg.sender].length(); i++) {
+        for (uint256 i; i < _rebalancingRewardHandlers[msg.sender].length(); i++) {
             address handler = _rebalancingRewardHandlers[msg.sender].at(i);
             IRebalancingRewardsHandler(handler).handleRebalancingRewards(
                 IConicPool(msg.sender),
@@ -135,8 +143,11 @@ contract InflationManager is IInflationManager, Ownable {
     function addPoolRebalancingRewardHandler(address poolAddress, address rebalancingRewardHandler)
         external
         override
-        onlyOwner
     {
+        require(
+            msg.sender == owner() || msg.sender == controller.emergencyMinter(),
+            "only owner or emergency minter"
+        );
         require(controller.isPool(poolAddress), "invalid pool");
         require(
             _rebalancingRewardHandlers[poolAddress].add(rebalancingRewardHandler),
@@ -149,13 +160,25 @@ contract InflationManager is IInflationManager, Ownable {
     function removePoolRebalancingRewardHandler(
         address poolAddress,
         address rebalancingRewardHandler
-    ) external override onlyOwner {
+    ) external override {
+        require(
+            msg.sender == owner() || msg.sender == controller.emergencyMinter(),
+            "only owner or emergency minter"
+        );
         require(controller.isPool(poolAddress), "invalid pool");
         require(
             _rebalancingRewardHandlers[poolAddress].remove(rebalancingRewardHandler),
             "handler not set"
         );
         emit RebalancingRewardHandlerRemoved(poolAddress, rebalancingRewardHandler);
+    }
+
+    function hasPoolRebalancingRewardHandlers(address poolAddress, address handler)
+        external
+        view
+        returns (bool)
+    {
+        return _rebalancingRewardHandlers[poolAddress].contains(handler);
     }
 
     function rebalancingRewardHandlers(address poolAddress)
@@ -169,13 +192,17 @@ contract InflationManager is IInflationManager, Ownable {
     function updatePoolWeights() public override {
         (address[] memory _pools, uint256[] memory poolWeights, ) = computePoolWeights();
         uint256 numPools = _pools.length;
-        for (uint256 i = 0; i < numPools; i++) {
+        ILpTokenStaker lpTokenStaker = controller.lpTokenStaker();
+        for (uint256 i; i < numPools; i++) {
             address curPool = _pools[i];
-            controller.lpTokenStaker().checkpoint(curPool);
+            IRewardManager(IConicPool(curPool).rewardManager()).poolCheckpoint();
+            lpTokenStaker.checkpoint(curPool);
             currentPoolWeights[curPool] = poolWeights[i];
         }
+        emit PoolWeightsUpdated();
     }
 
+    /// @dev Pool weights will be updated periodically
     function getCurrentPoolInflationRate(address pool) external view override returns (uint256) {
         return currentInflationRate.mulDown(currentPoolWeights[pool]);
     }

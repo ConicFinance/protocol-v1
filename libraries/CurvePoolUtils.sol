@@ -21,7 +21,7 @@ library CurvePoolUtils {
     struct PoolMeta {
         address pool;
         uint256 numberOfCoins;
-        uint256 assetType;
+        AssetType assetType;
         uint256[] decimals;
         uint256[] prices;
         uint256[] thresholds;
@@ -42,7 +42,7 @@ library CurvePoolUtils {
 
             uint256 toActual;
 
-            if (poolMeta.assetType == uint256(AssetType.CRYPTO)) {
+            if (poolMeta.assetType == AssetType.CRYPTO) {
                 // Handling crypto pools
                 toActual = ICurvePoolV2(poolMeta.pool).get_dy(0, i, fromBalance);
             } else {

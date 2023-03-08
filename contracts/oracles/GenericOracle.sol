@@ -6,6 +6,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "../../interfaces/IOracle.sol";
 
 contract GenericOracle is IOracle, Ownable {
+    event CustomOracleAdded(address token, address oracle);
+
     mapping(address => IOracle) public customOracles;
 
     IOracle internal _chainlinkOracle;
@@ -36,5 +38,6 @@ contract GenericOracle is IOracle, Ownable {
 
     function setCustomOracle(address token, address oracle) external onlyOwner {
         customOracles[token] = IOracle(oracle);
+        emit CustomOracleAdded(token, oracle);
     }
 }

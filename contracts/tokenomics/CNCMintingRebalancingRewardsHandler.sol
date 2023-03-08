@@ -5,35 +5,42 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
-import "../../interfaces/tokenomics/IRebalancingRewardsHandler.sol";
+import "../../interfaces/tokenomics/ICNCMintingRebalancingRewardsHandler.sol";
 import "../../interfaces/tokenomics/IInflationManager.sol";
 import "../../interfaces/tokenomics/ICNCToken.sol";
-import "../../interfaces/IController.sol";
 import "../../interfaces/pools/IConicPool.sol";
 import "../../libraries/ScaledMath.sol";
+import "./BaseMinter.sol";
 
-contract CNCMintingRebalancingRewardsHandler is IRebalancingRewardsHandler, Ownable {
+contract CNCMintingRebalancingRewardsHandler is
+    ICNCMintingRebalancingRewardsHandler,
+    Ownable,
+    BaseMinter
+{
     using ScaledMath for uint256;
     using EnumerableSet for EnumerableSet.AddressSet;
 
-    event SetCncRebalancingRewardPerDollarPerSecond(uint256 cncRebalancingRewardPerDollarPerSecond);
+    /// @dev the maximum amount of CNC that can be minted for rebalancing rewards
+    uint256 internal constant _MAX_REBALANCING_REWARDS = 1_900_000e18; // 19% of total supply
 
-    /// @dev gives out 1 dollar per 6 hours (assuming 1 CNC = 5 USD) for every 10,000 USD of TVL
+    /// @dev gives out 1 dollar per 1 hour (assuming 1 CNC = 10 USD) for every 10,000 USD of TVL
     uint256 internal constant _INITIAL_REBALANCING_REWARD_PER_DOLLAR_PER_SECOND =
-        1e18 / uint256(3600 * 6 * 10_000 * 5);
+        1e18 / uint256(3600 * 1 * 10_000 * 10);
 
-    /// @dev to avoid CNC rewards being too low, the TVL is assumed to be at least 100k
+    /// @dev to avoid CNC rewards being too low, the TVL is assumed to be at least 10k
     /// when computing the rebalancing rewards
-    uint256 internal constant _MIN_REBALANCING_REWARD_DOLAR_MULTIPLIER = 100_000e18;
+    uint256 internal constant _INITIAL_MIN_REBALANCING_REWARD_DOLLAR_MULTIPLIER = 10_000e18;
 
     /// @dev to avoid CNC rewards being too high, the TVL is assumed to be at most 10m
     /// when computing the rebalancing rewards
-    uint256 internal constant _MAX_REBALANCING_REWARD_DOLAR_MULTIPLIER = 10_000_000e18;
+    uint256 internal constant _INITIAL_MAX_REBALANCING_REWARD_DOLLAR_MULTIPLIER = 10_000_000e18;
 
-    ICNCToken public immutable cnc;
-    IController public immutable controller;
+    IController public immutable override controller;
 
-    uint256 public cncRebalancingRewardPerDollarPerSecond;
+    uint256 public override totalCncMinted;
+    uint256 public override cncRebalancingRewardPerDollarPerSecond;
+    uint256 public override maxRebalancingRewardDollarMultiplier;
+    uint256 public override minRebalancingRewardDollarMultiplier;
 
     modifier onlyInflationManager() {
         require(
@@ -43,39 +50,72 @@ contract CNCMintingRebalancingRewardsHandler is IRebalancingRewardsHandler, Owna
         _;
     }
 
-    constructor(IController _controller, ICNCToken _cnc) {
+    constructor(
+        IController _controller,
+        ICNCToken _cnc,
+        address emergencyMinter
+    ) BaseMinter(_cnc, emergencyMinter) {
         cncRebalancingRewardPerDollarPerSecond = _INITIAL_REBALANCING_REWARD_PER_DOLLAR_PER_SECOND;
+        minRebalancingRewardDollarMultiplier = _INITIAL_MIN_REBALANCING_REWARD_DOLLAR_MULTIPLIER;
+        maxRebalancingRewardDollarMultiplier = _INITIAL_MAX_REBALANCING_REWARD_DOLLAR_MULTIPLIER;
         controller = _controller;
-        cnc = _cnc;
     }
 
     function setCncRebalancingRewardPerDollarPerSecond(
         uint256 _cncRebalancingRewardPerDollarPerSecond
-    ) external onlyOwner {
+    ) external override onlyOwner {
         cncRebalancingRewardPerDollarPerSecond = _cncRebalancingRewardPerDollarPerSecond;
         emit SetCncRebalancingRewardPerDollarPerSecond(_cncRebalancingRewardPerDollarPerSecond);
     }
 
-    function distributeRebalancingRewards(
+    function setMaxRebalancingRewardDollarMultiplier(uint256 _maxRebalancingRewardDollarMultiplier)
+        external
+        override
+        onlyOwner
+    {
+        maxRebalancingRewardDollarMultiplier = _maxRebalancingRewardDollarMultiplier;
+        emit SetMaxRebalancingRewardDollarMultiplier(_maxRebalancingRewardDollarMultiplier);
+    }
+
+    function setMinRebalancingRewardDollarMultiplier(uint256 _minRebalancingRewardDollarMultiplier)
+        external
+        override
+        onlyOwner
+    {
+        minRebalancingRewardDollarMultiplier = _minRebalancingRewardDollarMultiplier;
+        emit SetMinRebalancingRewardDollarMultiplier(_minRebalancingRewardDollarMultiplier);
+    }
+
+    function _distributeRebalancingRewards(
         address pool,
         address account,
         uint256 amount
     ) internal {
+        if (totalCncMinted + amount > _MAX_REBALANCING_REWARDS) {
+            amount = _MAX_REBALANCING_REWARDS - totalCncMinted;
+        }
+        if (amount == 0) return;
         uint256 mintedAmount = cnc.mint(account, amount);
         if (mintedAmount > 0) {
+            totalCncMinted += mintedAmount;
             emit RebalancingRewardDistributed(pool, account, address(cnc), mintedAmount);
         }
     }
 
-    function poolCNCRebalancingRewardPerSecond(address pool) public view returns (uint256) {
+    function poolCNCRebalancingRewardPerSecond(address pool)
+        public
+        view
+        override
+        returns (uint256)
+    {
         (uint256 poolWeight, uint256 totalUSDValue) = controller
             .inflationManager()
             .computePoolWeight(pool);
         uint256 tvlMultiplier = totalUSDValue;
-        if (tvlMultiplier < _MIN_REBALANCING_REWARD_DOLAR_MULTIPLIER)
-            tvlMultiplier = _MIN_REBALANCING_REWARD_DOLAR_MULTIPLIER;
-        if (tvlMultiplier > _MAX_REBALANCING_REWARD_DOLAR_MULTIPLIER)
-            tvlMultiplier = _MAX_REBALANCING_REWARD_DOLAR_MULTIPLIER;
+        if (tvlMultiplier < minRebalancingRewardDollarMultiplier)
+            tvlMultiplier = minRebalancingRewardDollarMultiplier;
+        if (tvlMultiplier > maxRebalancingRewardDollarMultiplier)
+            tvlMultiplier = maxRebalancingRewardDollarMultiplier;
         return cncRebalancingRewardPerDollarPerSecond.mulDown(poolWeight).mulDown(tvlMultiplier);
     }
 
@@ -85,14 +125,12 @@ contract CNCMintingRebalancingRewardsHandler is IRebalancingRewardsHandler, Owna
         uint256 deviationBefore,
         uint256 deviationAfter
     ) external onlyInflationManager {
-        uint256 cncPerSecond = poolCNCRebalancingRewardPerSecond(address(conicPool));
-        uint256 cncRewardAmount = _computeRebalancingRewards(
-            conicPool,
+        uint256 cncRewardAmount = computeRebalancingRewards(
+            address(conicPool),
             deviationBefore,
-            deviationAfter,
-            cncPerSecond
+            deviationAfter
         );
-        distributeRebalancingRewards(address(conicPool), account, cncRewardAmount);
+        _distributeRebalancingRewards(address(conicPool), account, cncRewardAmount);
     }
 
     /// @dev this computes how much CNC a user should get when depositing
@@ -104,18 +142,18 @@ contract CNCMintingRebalancingRewardsHandler is IRebalancingRewardsHandler, Owna
     /// Δdeviation: the deviation difference caused by this deposit
     /// initialDeviation: the deviation after updating weights
     /// @return the amount of CNC to give to the user as reward
-    function _computeRebalancingRewards(
-        IConicPool conicPool,
+    function computeRebalancingRewards(
+        address conicPool,
         uint256 deviationBefore,
-        uint256 deviationAfter,
-        uint256 cncPerSecond
-    ) internal view returns (uint256) {
+        uint256 deviationAfter
+    ) public view override returns (uint256) {
         if (deviationBefore < deviationAfter) return 0;
+        uint256 cncPerSecond = poolCNCRebalancingRewardPerSecond(conicPool);
         uint256 deviationDelta = deviationBefore - deviationAfter;
         uint256 deviationImprovementRatio = deviationDelta.divDown(
-            conicPool.totalDeviationAfterWeightUpdate()
+            IConicPool(conicPool).totalDeviationAfterWeightUpdate()
         );
-        uint256 lastWeightUpdate = controller.lastWeightUpdate(address(conicPool));
+        uint256 lastWeightUpdate = controller.lastWeightUpdate(conicPool);
         uint256 elapsedSinceUpdate = uint256(block.timestamp) - lastWeightUpdate;
         return (elapsedSinceUpdate * cncPerSecond).mulDown(deviationImprovementRatio);
     }

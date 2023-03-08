@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity 0.8.17;
 
+import "@openzeppelin/contracts/utils/Address.sol";
+
 import "./SimpleAccessControl.sol";
 import "../../interfaces/access/IGovernanceProxy.sol";
 
 contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
+    using Address for address;
+
     bytes32 public constant GOVERNANCE_ROLE = "GOVERNANCE";
     bytes32 public constant VETO_ROLE = "VETO";
 
@@ -27,8 +31,9 @@ contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
     /// any contract as the length is completely unbounded
     Change[] internal endedChanges;
 
-    constructor(address governance) {
+    constructor(address governance, address veto) {
         _grantRole(GOVERNANCE_ROLE, governance);
+        _grantRole(VETO_ROLE, veto);
     }
 
     /// @return change the pending change with the given id if found
@@ -61,23 +66,29 @@ contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
     /// which means that it might be useful to start paginatign from the end of the array
     function getEndedChanges(uint256 offset, uint256 n) external view returns (Change[] memory) {
         Change[] memory paginated = new Change[](n);
-        for (uint256 i = 0; i < n; i++) {
+        for (uint256 i; i < n; i++) {
             paginated[i] = endedChanges[offset + i];
         }
         return paginated;
     }
 
-    /// @notice Requests a change to be executed
-    /// @param target the contract to cal for this change
-    /// @param data the data to be passed when calling `target`
+    /// @notice Requests a list of function calls to be executed as a change
+    /// @dev If the change requires no delay, it will be executed immediately
+    /// @param calls the calls to be executed
     /// this should be fully encoded including the selectors and the abi-encoded arguments
     /// Changes can only be requested by governance
-    function requestChange(address target, bytes calldata data) external onlyRole(GOVERNANCE_ROLE) {
-        uint64 delay = _computeDelay(data);
+    function requestChange(Call[] calldata calls) external onlyRole(GOVERNANCE_ROLE) {
+        // Calculating the maximum delay for all calls
+        uint64 maxDelay;
+        for (uint256 i; i < calls.length; i++) {
+            uint64 delay = _computeDelay(calls[i].data);
+            if (delay > maxDelay) maxDelay = delay;
+        }
 
-        (Change memory change, uint256 index) = _requestChange(target, delay, data);
+        (Change storage change, uint256 index) = _requestChange(maxDelay, calls);
 
-        if (delay == 0) {
+        // If the change requires no delay, execute it immediately
+        if (maxDelay == 0) {
             _executeChange(change, index);
         }
     }
@@ -86,7 +97,7 @@ contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
     /// The deadline of the change must be past
     /// Anyone can execute a pending change but in practice, this will be called by governance too
     function executeChange(uint64 id) external {
-        (Change memory change, uint256 index) = _findPendingChange(id);
+        (Change storage change, uint256 index) = _findPendingChange(id);
         _executeChange(change, index);
     }
 
@@ -98,9 +109,9 @@ contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
             "not authorized"
         );
 
-        (Change memory change, uint256 index) = _findPendingChange(id);
-        _endChange(change, index, Status.Canceled);
+        (Change storage change, uint256 index) = _findPendingChange(id);
         emit ChangeCanceled(id);
+        _endChange(change, index, Status.Canceled);
     }
 
     // the following functions should be called through `executeChange`
@@ -108,10 +119,12 @@ contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
     function updateDelay(bytes4 selector, uint64 delay) external override {
         require(msg.sender == address(this), "not authorized");
         delays[selector] = delay;
+        emit DelayUpdated(selector, delay);
     }
 
     function grantRole(bytes32 role, address account) external override {
         require(msg.sender == address(this), "not authorized");
+        require(role == GOVERNANCE_ROLE || role == VETO_ROLE, "invalid role");
         _grantRole(role, account);
     }
 
@@ -126,52 +139,49 @@ contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
 
     // internal helpers
 
-    function _requestChange(
-        address target,
-        uint64 delay,
-        bytes calldata data
-    ) internal returns (Change memory change, uint256 index) {
-        uint64 id = nextChangeId;
-        change = Change({
-            target: target,
-            data: data,
-            id: id,
-            requestedAt: uint64(block.timestamp),
-            endedAt: 0,
-            delay: delay,
-            status: Status.Pending
-        });
+    function _requestChange(uint64 delay, Call[] calldata calls)
+        internal
+        returns (Change storage change, uint256 index)
+    {
+        uint64 id = nextChangeId++;
+        change = pendingChanges.push();
+        change.id = id;
+        change.requestedAt = uint64(block.timestamp);
+        change.endedAt = 0;
+        change.delay = delay;
+        change.status = Status.Pending;
+        for (uint256 i; i < calls.length; i++) {
+            change.calls.push(calls[i]);
+        }
 
-        nextChangeId++;
-
-        pendingChanges.push(change);
         index = pendingChanges.length - 1;
 
-        emit ChangeRequested(target, data, delay, id);
+        emit ChangeRequested(calls, delay, id);
     }
 
-    function _executeChange(Change memory change, uint256 index) internal {
+    function _executeChange(Change storage change, uint256 index) internal {
         require(
             change.requestedAt + change.delay <= block.timestamp,
             "deadline has not been reached"
         );
 
-        (bool success, ) = change.target.call(change.data);
-        require(success, "call failed");
+        for (uint256 i; i < change.calls.length; i++) {
+            change.calls[i].target.functionCall(change.calls[i].data);
+        }
 
-        _endChange(change, index, Status.Executed);
         emit ChangeExecuted(change.id);
+        _endChange(change, index, Status.Executed);
     }
 
     function _endChange(
-        Change memory change,
+        Change storage change,
         uint256 index,
         Status status
     ) internal {
-        _removePendingChange(index);
         change.status = status;
         change.endedAt = uint64(block.timestamp);
         endedChanges.push(change);
+        _removePendingChange(index);
     }
 
     function _removePendingChange(uint256 index) internal {
@@ -179,8 +189,8 @@ contract GovernanceProxy is IGovernanceProxy, SimpleAccessControl {
         pendingChanges.pop();
     }
 
-    function _findPendingChange(uint64 id) internal view returns (Change memory, uint256 index) {
-        for (uint256 i = 0; i < pendingChanges.length; i++) {
+    function _findPendingChange(uint64 id) internal view returns (Change storage, uint256 index) {
+        for (uint256 i; i < pendingChanges.length; i++) {
             if (pendingChanges[i].id == id) {
                 return (pendingChanges[i], i);
             }

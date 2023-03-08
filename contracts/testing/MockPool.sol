@@ -3,7 +3,9 @@ pragma solidity 0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/structs/EnumerableMap.sol";
 import "../../interfaces/pools/IConicPool.sol";
+import "../../interfaces/IController.sol";
 import "../../interfaces/tokenomics/IInflationManager.sol";
 import "../../interfaces/tokenomics/ILpTokenStaker.sol";
 import "../LpToken.sol";
@@ -58,26 +60,26 @@ contract MockRewardManager is IRewardManager {
 }
 
 contract MockPool is IConicPool {
+    using EnumerableMap for EnumerableMap.AddressToUintMap;
+
+    EnumerableMap.AddressToUintMap internal weights;
     IRewardManager public immutable rewardManager;
     ILpToken public immutable override lpToken;
+    IController public immutable controller;
     IInflationManager private immutable _inflationManager;
-    ILpTokenStaker private immutable lpTokenStaker;
 
     bool internal _useFakeTotalUnderlying;
     uint256 internal _fakeTotalUnderlying;
+    bool public isShutdown;
 
     IERC20Metadata public override underlying;
 
-    constructor(
-        address inflationManager,
-        address _underlying,
-        address _lpTokenStaker
-    ) {
+    constructor(IController controller_, address _underlying) {
         underlying = IERC20Metadata(_underlying);
         rewardManager = new MockRewardManager(address(this));
         lpToken = new LpToken(address(this), 18, "TEST", "TEST");
-        _inflationManager = IInflationManager(inflationManager);
-        lpTokenStaker = ILpTokenStaker(_lpTokenStaker);
+        _inflationManager = controller_.inflationManager();
+        controller = controller_;
     }
 
     function depositFor(
@@ -99,6 +101,10 @@ contract MockPool is IConicPool {
 
     function allCurvePools() external view returns (address[] memory) {}
 
+    function curvePoolsCount() external view override returns (uint256) {}
+
+    function getCurvePoolAtIndex(uint256 _index) external view returns (address) {}
+
     function curveLpOracle() external view returns (IOracle) {}
 
     function tokenOracle() external view returns (IOracle) {}
@@ -107,14 +113,39 @@ contract MockPool is IConicPool {
 
     function handleInvalidConvexPid(address pool) external {}
 
+    function handleDepeggedCurvePool(address curvePool_) external {}
+
+    function unstakeAndWithdraw(uint256 _amount, uint256 _minAmount) external returns (uint256) {}
+
     function withdraw(uint256 _amount, uint256 _minAmount) external returns (uint256) {}
 
-    function updateWeights(PoolWeight[] memory poolWeights) external {}
+    function isBalanced() external view returns (bool) {}
 
-    function getWeights() external pure override returns (PoolWeight[] memory) {
-        PoolWeight[] memory value_;
-        return value_;
+    function updateWeights(PoolWeight[] memory poolWeights) external {
+        for (uint256 i = 0; i < poolWeights.length; i++) {
+            weights.set(poolWeights[i].poolAddress, poolWeights[i].weight);
+        }
     }
+
+    function shutdownPool() external override {
+        isShutdown = true;
+    }
+
+    function getWeight(address curvePool) external view returns (uint256) {
+        return weights.get(curvePool);
+    }
+
+    function getWeights() external view override returns (PoolWeight[] memory) {
+        uint256 length_ = weights.length();
+        PoolWeight[] memory weights_ = new PoolWeight[](length_);
+        for (uint256 i; i < length_; i++) {
+            (address pool_, uint256 weight_) = weights.at(i);
+            weights_[i] = PoolWeight(pool_, weight_);
+        }
+        return weights_;
+    }
+
+    function totalCurveLpBalance(address curvePool_) public view returns (uint256) {}
 
     function getAllocatedUnderlying() external pure override returns (PoolWithAmount[] memory) {
         PoolWithAmount[] memory value_;
@@ -138,6 +169,16 @@ contract MockPool is IConicPool {
         return _fakeTotalUnderlying;
     }
 
+    function getTotalAndPerPoolUnderlying()
+        external
+        view
+        returns (
+            uint256 totalUnderlying_,
+            uint256 totalAllocated_,
+            uint256[] memory perPoolUnderlying_
+        )
+    {}
+
     function mintLPTokens(address _account, uint256 _amount) external {
         mintLPTokens(_account, _amount, false);
     }
@@ -152,14 +193,14 @@ contract MockPool is IConicPool {
             updateTotalUnderlying(totalUnderlying() + _amount);
         } else {
             lpToken.mint(address(this), _amount);
-            IERC20(lpToken).approve(address(lpTokenStaker), _amount);
-            lpTokenStaker.stakeFor(_amount, address(this), _account);
+            IERC20(lpToken).approve(address(controller.lpTokenStaker()), _amount);
+            controller.lpTokenStaker().stakeFor(_amount, address(this), _account);
             updateTotalUnderlying(totalUnderlying() + _amount);
         }
     }
 
     function burnLPTokens(address _account, uint256 _amount) external {
-        lpTokenStaker.unstake(_amount, address(this));
+        controller.lpTokenStaker().unstake(_amount, address(this));
         lpToken.burn(_account, _amount);
         updateTotalUnderlying(totalUnderlying() - _amount);
     }
@@ -176,7 +217,7 @@ contract MockPool is IConicPool {
 
     function addCurvePool(address pool) external {}
 
-    function usdExchangeRate() external view override returns (uint256) {
+    function usdExchangeRate() external pure override returns (uint256) {
         return 1e18;
     }
 }

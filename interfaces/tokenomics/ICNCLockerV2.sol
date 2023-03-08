@@ -11,18 +11,36 @@ interface ICNCLockerV2 {
     event FeesReceived(address indexed sender, uint256 crvAmount, uint256 cvxAmount);
     event FeesClaimed(address indexed claimer, uint256 crvAmount, uint256 cvxAmount);
     event AirdropBoostClaimed(address indexed claimer, uint256 amount);
+    event Shutdown();
+    event TokenRecovered(address indexed token);
 
-    function lock(uint256 amount, uint128 lockTime) external;
+    struct VoteLock {
+        uint256 amount;
+        uint64 unlockTime;
+        uint128 boost;
+        uint64 id;
+    }
+
+    function lock(uint256 amount, uint64 lockTime) external;
 
     function lock(
         uint256 amount,
-        uint128 lockTime,
+        uint64 lockTime,
         bool relock
     ) external;
 
-    function relock(uint256 lockIndex, uint128 lockTime) external;
+    function lockFor(
+        uint256 amount,
+        uint64 lockTime,
+        bool relock,
+        address account
+    ) external;
 
-    function relock(uint128 lockTime) external;
+    function relock(uint64 lockId, uint64 lockTime) external;
+
+    function relock(uint64 lockTime) external;
+
+    function relockMultiple(uint64[] calldata lockIds, uint64 lockTime) external;
 
     function totalBoosted() external view returns (uint256);
 
@@ -32,11 +50,11 @@ interface ICNCLockerV2 {
 
     function executeAvailableUnlocks() external returns (uint256);
 
-    function claimAirdropBoost(
-        address claimer,
-        uint256 amount,
-        MerkleProof.Proof calldata proof
-    ) external;
+    function executeAvailableUnlocksFor(address dst) external returns (uint256);
+
+    function executeUnlocks(address dst, uint64[] calldata lockIds) external returns (uint256);
+
+    function claimAirdropBoost(uint256 amount, MerkleProof.Proof calldata proof) external;
 
     // This will need to include the boosts etc.
     function balanceOf(address user) external view returns (uint256);
@@ -45,17 +63,26 @@ interface ICNCLockerV2 {
 
     function unlockableBalanceBoosted(address user) external view returns (uint256);
 
-    function kick(address user, uint256 lockIndex) external;
+    function kick(address user, uint64 lockId) external;
 
     function receiveFees(uint256 amountCrv, uint256 amountCvx) external;
 
-    function claimFees() external;
+    function claimableFees(address account)
+        external
+        view
+        returns (uint256 claimableCrv, uint256 claimableCvx);
+
+    function claimFees() external returns (uint256 crvAmount, uint256 cvxAmount);
 
     function computeBoost(uint128 lockTime) external view returns (uint128);
 
     function airdropBoost(address account) external view returns (uint256);
 
+    function claimedAirdrop(address account) external view returns (bool);
+
     function totalVoteBoost(address account) external view returns (uint256);
 
     function totalRewardsBoost(address account) external view returns (uint256);
+
+    function userLocks(address account) external view returns (VoteLock[] memory);
 }

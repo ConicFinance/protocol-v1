@@ -29,6 +29,13 @@ library ScaledMath {
         return (a * 10**decimals) / b;
     }
 
+    function divUp(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        return ((a * ONE) - 1) / b + 1;
+    }
+
     function mulDown(int256 a, int256 b) internal pure returns (int256) {
         return (a * b) / int256(ONE);
     }
@@ -115,7 +122,7 @@ library ScaledMath {
 
     function intPow(uint256 a, uint256 n) internal pure returns (uint256) {
         uint256 result = ONE;
-        for (uint256 i = 0; i < n; ) {
+        for (uint256 i; i < n; ) {
             result = mulDown(result, a);
             unchecked {
                 ++i;
@@ -125,6 +132,8 @@ library ScaledMath {
     }
 
     function absSub(uint256 a, uint256 b) internal pure returns (uint256) {
-        return a >= b ? a - b : b - a;
+        unchecked {
+            return a >= b ? a - b : b - a;
+        }
     }
 }

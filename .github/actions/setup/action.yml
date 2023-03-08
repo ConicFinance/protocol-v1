@@ -1,0 +1,20 @@
+name: "Setup project"
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/checkout@v2
+    - name: Setup Node
+      uses: actions/setup-node@v3
+      with:
+        node-version: 16
+    - name: Install npm depdencies
+      run: yarn
+      shell: bash
+    - name: Install ganache
+      run: npm install -g ganache
+      shell: bash
+    - name: Install Foundry
+      uses: foundry-rs/foundry-toolchain@v1
+      with:
+        version: nightly

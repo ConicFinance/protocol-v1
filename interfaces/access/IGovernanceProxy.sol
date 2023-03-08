@@ -5,12 +5,7 @@ import "./ISimpleAccessControl.sol";
 
 interface IGovernanceProxy is ISimpleAccessControl {
     /// @notice emitted when a change is requested by governance
-    event ChangeRequested(
-        address indexed target,
-        bytes data,
-        uint64 delay,
-        uint64 changeId
-    );
+    event ChangeRequested(Call[] calls, uint64 delay, uint64 changeId);
 
     /// @notice emitted when a change is executed
     /// this can be in the same block as `ChangeRequested` if there is no
@@ -30,27 +25,33 @@ interface IGovernanceProxy is ISimpleAccessControl {
         Executed
     }
 
-    /// @notice this represents a change to execute
+    /// @notice this represents a function call as part of a Change
     /// The target is the contract to execute the function on
     /// The data is the function signature and the abi-encoded arguments
+    struct Call {
+        address target;
+        bytes data;
+    }
+
+    /// @notice this represents a change to execute a set of function calls
     /// The ID is an unique auto-incrementing id that will be generated for each change
     /// The status is one of pending, canceled or executed and is pending when the change is created
+    /// The requestedAt is the timestamp when the change was requested
+    /// The delay is the delay in seconds before the change can be executed
+    /// The endedAt is the timestamp when the change was executed or canceled
+    /// The calls are the function calls to execute as part of the change
     struct Change {
-        address target;
         Status status;
         uint64 id;
         uint64 requestedAt;
         uint64 delay;
         uint64 endedAt;
-        bytes data;
+        Call[] calls;
     }
 
     function delays(bytes4 selector) external view returns (uint64);
 
-    function getPendingChange(uint64 changeId)
-        external
-        view
-        returns (Change memory change);
+    function getPendingChange(uint64 changeId) external view returns (Change memory change);
 
     function getPendingChanges() external view returns (Change[] memory);
 
@@ -58,12 +59,9 @@ interface IGovernanceProxy is ISimpleAccessControl {
 
     function getEndedChanges() external view returns (Change[] memory);
 
-    function getEndedChanges(uint256 offset, uint256 n)
-        external
-        view
-        returns (Change[] memory);
+    function getEndedChanges(uint256 offset, uint256 n) external view returns (Change[] memory);
 
-    function requestChange(address target, bytes calldata data) external;
+    function requestChange(Call[] calldata calls) external;
 
     function executeChange(uint64 id) external;
 

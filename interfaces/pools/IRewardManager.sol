@@ -10,7 +10,7 @@ interface IRewardManager {
     event FeesSet(uint256 feePercentage);
     event FeesEnabled(uint256 feePercentage);
     event EarningsClaimed(
-        address claimedBy,
+        address indexed claimedBy,
         uint256 cncEarned,
         uint256 crvEarned,
         uint256 cvxEarned

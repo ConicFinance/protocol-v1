@@ -4,8 +4,8 @@ pragma solidity 0.8.17;
 interface IInflationManager {
     event TokensClaimed(address indexed pool, uint256 cncAmount);
     event RebalancingRewardHandlerAdded(address indexed pool, address indexed handler);
-
     event RebalancingRewardHandlerRemoved(address indexed pool, address indexed handler);
+    event PoolWeightsUpdated();
 
     function executeInflationRateUpdate() external;
 
@@ -49,4 +49,9 @@ interface IInflationManager {
         external
         view
         returns (address[] memory);
+
+    function hasPoolRebalancingRewardHandlers(address poolAddress, address handler)
+        external
+        view
+        returns (bool);
 }

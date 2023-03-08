@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity 0.8.17;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@chainlink/contracts/Denominations.sol";
 import "@chainlink/contracts/interfaces/FeedRegistryInterface.sol";
 
@@ -40,7 +39,7 @@ interface IAggregatorV3Interface {
         );
 }
 
-contract ChainlinkOracle is IOracle, Ownable {
+contract ChainlinkOracle is IOracle {
     FeedRegistryInterface internal constant _feedRegistry =
         FeedRegistryInterface(0x47Fb2585D2C56Fe188D0E6ec628a38b74fCeeeDf);
 
@@ -57,6 +56,7 @@ contract ChainlinkOracle is IOracle, Ownable {
         }
     }
 
+    // Prices are always provided with 18 decimals pecision
     function getUSDPrice(address token) external view returns (uint256) {
         return _getPrice(token, Denominations.USD, false);
     }

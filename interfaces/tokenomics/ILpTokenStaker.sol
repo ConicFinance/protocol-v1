@@ -5,6 +5,7 @@ interface ILpTokenStaker {
     event LpTokenStaked(address indexed account, uint256 amount);
     event LpTokenUnstaked(address indexed account, uint256 amount);
     event TokensClaimed(address indexed pool, uint256 cncAmount);
+    event Shutdown();
 
     function stake(uint256 amount, address conicPool) external;
 
@@ -22,6 +23,8 @@ interface ILpTokenStaker {
         address account
     ) external;
 
+    function unstakeFrom(uint256 amount, address account) external;
+
     function getUserBalanceForPool(address conicPool, address account)
         external
         view
@@ -36,6 +39,8 @@ interface ILpTokenStaker {
     function claimableCnc(address pool) external view returns (uint256);
 
     function checkpoint(address pool) external returns (uint256);
+
+    function shutdown() external;
 
     function getBoost(address user) external view returns (uint256);
 }

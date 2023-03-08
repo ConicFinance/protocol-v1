@@ -3,7 +3,6 @@ pragma solidity 0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
 import "../interfaces/IConvexHandler.sol";
 import "../interfaces/pools/ILpToken.sol";
@@ -13,10 +12,8 @@ import "../interfaces/vendor/IBaseRewardPool.sol";
 import "../interfaces/ICurveRegistryCache.sol";
 import "../interfaces/IController.sol";
 
-contract ConvexHandler is IConvexHandler, Ownable {
+contract ConvexHandler is IConvexHandler {
     using SafeERC20 for IERC20;
-
-    address public constant BOOSTER = address(0xF403C135812408BFbE8713b5A23a04b3D48AAE31);
 
     uint256 internal constant _CLIFF_COUNT = 1000;
     uint256 internal constant _CLIFF_SIZE = 100_000e18;
@@ -35,7 +32,7 @@ contract ConvexHandler is IConvexHandler, Ownable {
     /// @param _amount Amount of Curve LP tokens to deposit
     function deposit(address _curvePool, uint256 _amount) external {
         uint256 pid = controller.curveRegistryCache().getPid(_curvePool);
-        IBooster(BOOSTER).deposit(pid, _amount, true);
+        IBooster(controller.convexBooster()).deposit(pid, _amount, true);
     }
 
     /// @notice Withdraws Curve LP tokens from Convex.
@@ -44,7 +41,6 @@ contract ConvexHandler is IConvexHandler, Ownable {
     /// @param _amount Amount of Curve LP tokens to withdraw.
     function withdraw(address _curvePool, uint256 _amount) external {
         address rewardPool = controller.curveRegistryCache().getRewardPool(_curvePool);
-        require(rewardPool != address(0), "reward pool does not exist");
         IBaseRewardPool(rewardPool).withdrawAndUnwrap(_amount, true);
     }
 
@@ -59,7 +55,7 @@ contract ConvexHandler is IConvexHandler, Ownable {
     /// @param _curvePools List of Curve pools from which LP tokens have been deposited
     /// @param _conicPool Conic pool for which rewards will be claimed.
     function claimBatchEarnings(address[] memory _curvePools, address _conicPool) external {
-        for (uint256 i = 0; i < _curvePools.length; i++) {
+        for (uint256 i; i < _curvePools.length; i++) {
             address pool = _curvePools[i];
             _claimConvexReward(pool, _conicPool);
         }
@@ -71,7 +67,6 @@ contract ConvexHandler is IConvexHandler, Ownable {
 
     function _claimConvexReward(address _curvePool, address _conicPool) internal {
         address rewardPool = controller.curveRegistryCache().getRewardPool(_curvePool);
-        require(rewardPool != address(0), "reward pool does not exist");
         IBaseRewardPool(rewardPool).getReward(_conicPool, true);
     }
 
@@ -82,7 +77,6 @@ contract ConvexHandler is IConvexHandler, Ownable {
     /// @return Total amount of CRV earned.
     function getCrvEarned(address _account, address _curvePool) public view returns (uint256) {
         address rewardPool = controller.curveRegistryCache().getRewardPool(_curvePool);
-        require(rewardPool != address(0), "invalid reward pool");
         return IBaseRewardPool(rewardPool).earned(_account);
     }
 
@@ -97,7 +91,7 @@ contract ConvexHandler is IConvexHandler, Ownable {
         returns (uint256)
     {
         uint256 totalCrvEarned;
-        for (uint256 i = 0; i < _curvePools.length; i++) {
+        for (uint256 i; i < _curvePools.length; i++) {
             address pool = _curvePools[i];
             totalCrvEarned += getCrvEarned(_account, pool);
         }

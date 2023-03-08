@@ -3,8 +3,6 @@ pragma solidity 0.8.17;
 
 import "../ConicPool.sol";
 
-import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-
 contract MockConicPool is ConicPool {
     // dev: gives access to LP token for testing
 
@@ -18,25 +16,16 @@ contract MockConicPool is ConicPool {
         string memory _lpTokenName,
         string memory _symbol,
         address _cvx,
-        address _crv,
-        address _lpTokenStaker
-    )
-        ConicPool(
-            _underlying,
-            _controller,
-            locker,
-            _lpTokenName,
-            _symbol,
-            _cvx,
-            _crv,
-            _lpTokenStaker
-        )
-    {}
+        address _crv
+    ) ConicPool(_underlying, _controller, locker, _lpTokenName, _symbol, _cvx, _crv) {}
 
     function balanceOf(address _account) external view returns (uint256) {
-        return
-            lpToken.balanceOf(_account) +
-            lpTokenStaker.getUserBalanceForPool(address(this), _account);
+        ILpTokenStaker lpTokenStaker = controller.lpTokenStaker();
+        uint256 balance = lpToken.balanceOf(_account);
+        if (address(lpTokenStaker) != address(0)) {
+            balance += lpTokenStaker.getUserBalanceForPool(address(this), _account);
+        }
+        return balance;
     }
 
     function totalSupply() external view returns (uint256) {
@@ -69,14 +58,14 @@ contract MockConicPool is ConicPool {
             updateTotalUnderlying(totalUnderlying() + _amount);
         } else {
             lpToken.mint(address(this), _amount);
-            IERC20(lpToken).approve(address(lpTokenStaker), _amount);
-            lpTokenStaker.stakeFor(_amount, address(this), _account);
+            IERC20(lpToken).approve(address(controller.lpTokenStaker()), _amount);
+            controller.lpTokenStaker().stakeFor(_amount, address(this), _account);
             updateTotalUnderlying(totalUnderlying() + _amount);
         }
     }
 
     function burnLpTokens(address _account, uint256 _amount) external {
-        lpTokenStaker.unstake(_amount, address(this));
+        controller.lpTokenStaker().unstake(_amount, address(this));
         lpToken.burn(_account, _amount);
         updateTotalUnderlying(totalUnderlying() - _amount);
     }
@@ -85,7 +74,7 @@ contract MockConicPool is ConicPool {
         return 1e18;
     }
 
-    function usdExchangeRate() external view override returns (uint256) {
+    function usdExchangeRate() external pure override returns (uint256) {
         return 1e18;
     }
 
@@ -95,21 +84,16 @@ contract MockConicPool is ConicPool {
     }
 
     function cachedTotalUnderlying() external view override returns (uint256) {
-        if (!_useFakeTotalUnderlying) {
-            if (block.timestamp > _cacheUpdatedTimestamp + _TOTAL_UNDERLYING_CACHE_EXPIRY) {
-                return totalUnderlying();
-            }
-            return _cachedTotalUnderlying;
+        if (_useFakeTotalUnderlying) return _fakeTotalUnderlying;
+        if (block.timestamp > _cacheUpdatedTimestamp + _TOTAL_UNDERLYING_CACHE_EXPIRY) {
+            return totalUnderlying();
         }
-        return _fakeTotalUnderlying;
+        return _cachedTotalUnderlying;
     }
 
     function totalUnderlying() public view override returns (uint256) {
-        if (!_useFakeTotalUnderlying) {
-            (uint256 totalUnderlying_, , ) = _getTotalAndPerPoolUnderlying();
-
-            return totalUnderlying_;
-        }
-        return _fakeTotalUnderlying;
+        if (_useFakeTotalUnderlying) return _fakeTotalUnderlying;
+        (uint256 totalUnderlying_, , ) = getTotalAndPerPoolUnderlying();
+        return totalUnderlying_;
     }
 }

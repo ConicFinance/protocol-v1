@@ -16,6 +16,8 @@ contract DerivativeOracle is IOracle, Ownable {
     using ScaledMath for uint256;
     using CurveLPTokenPricing for ICurvePoolV1;
 
+    event ImbalanceThresholdUpdated(uint256 threshold);
+
     uint256 internal constant _DEFAULT_IMBALANCE_THRESHOLD = 0.02e18;
     uint256 internal constant _MAX_IMBALANCE_THRESHOLD = 0.1e18;
     uint256 public imbalanceThreshold;
@@ -34,10 +36,7 @@ contract DerivativeOracle is IOracle, Ownable {
         if (!curveRegistryCache.isRegistered(curvePoolAddress_)) {
             return false;
         }
-        if (
-            curveRegistryCache.assetType(curvePoolAddress_) ==
-            uint256(CurvePoolUtils.AssetType.CRYPTO)
-        ) {
+        if (curveRegistryCache.assetType(curvePoolAddress_) == CurvePoolUtils.AssetType.CRYPTO) {
             return false;
         }
         // this oracle does not support meta-pools
@@ -50,23 +49,22 @@ contract DerivativeOracle is IOracle, Ownable {
     function getUSDPrice(address token) external view returns (uint256) {
         ICurveRegistryCache curveRegistryCache = _controller.curveRegistryCache();
         ICurvePoolV1 curvePool = ICurvePoolV1(curveRegistryCache.poolFromLpToken(token));
+        address[] memory coins = curveRegistryCache.coins(address(curvePool));
         uint256 _numberOfCoins = curveRegistryCache.nCoins(address(curvePool));
         require(_numberOfCoins == 2, "only 2 coin pools are supported");
         uint256[] memory decimals = curveRegistryCache.decimals(address(curvePool));
-        uint256 assetType = curveRegistryCache.assetType(address(curvePool));
-        require(assetType != uint256(CurvePoolUtils.AssetType.CRYPTO), "crypto pool not supported");
+        CurvePoolUtils.AssetType assetType = curveRegistryCache.assetType(address(curvePool));
+        require(assetType != CurvePoolUtils.AssetType.CRYPTO, "crypto pool not supported");
 
         uint256[] memory prices = new uint256[](_numberOfCoins);
         uint256[] memory thresholds = new uint256[](_numberOfCoins);
         uint256 imbalanceThreshold_ = imbalanceThreshold;
         for (uint256 i; i < _numberOfCoins; i++) {
-            address coin = curvePool.coins(i);
+            address coin = coins[i];
             uint256 price = _genericOracle.getUSDPrice(coin);
             prices[i] = price;
             thresholds[i] = imbalanceThreshold_;
             require(price > 0, "price is 0");
-            uint256 balance = curvePool.balances(i).convertScale(uint8(decimals[i]), 18);
-            require(balance > 0, "balance is 0");
         }
 
         // Verifying the pool is balanced
@@ -91,6 +89,7 @@ contract DerivativeOracle is IOracle, Ownable {
     function setImbalanceThreshold(uint256 threshold) external onlyOwner {
         require(threshold <= _MAX_IMBALANCE_THRESHOLD, "threshold too high");
         imbalanceThreshold = threshold;
+        emit ImbalanceThresholdUpdated(threshold);
     }
 
     function _getCurvePool(address lpToken_) internal view returns (address) {

@@ -29,4 +29,6 @@ interface IBooster {
     function depositAll(uint256 _pid, bool _stake) external returns (bool);
 
     function earmarkRewards(uint256 _pid) external returns (bool);
+
+    function isShutdown() external view returns (bool);
 }

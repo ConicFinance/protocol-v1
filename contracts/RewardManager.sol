@@ -46,7 +46,6 @@ contract RewardManager is IRewardManager, Ownable {
     ILpToken public immutable lpToken;
     IERC20 public immutable underlying;
     IController public immutable controller;
-    ILpTokenStaker public immutable lpTokenStaker;
     ICNCLockerV2 public immutable locker;
 
     uint256 internal _oldCrvBalance;
@@ -64,14 +63,12 @@ contract RewardManager is IRewardManager, Ownable {
         address _pool,
         address _lpToken,
         address _underlying,
-        address _lpTokenStaker,
         address cncLocker
     ) {
         pool = _pool;
         lpToken = ILpToken(_lpToken);
         underlying = IERC20(_underlying);
         controller = IController(_controller);
-        lpTokenStaker = ILpTokenStaker(_lpTokenStaker);
         WETH.safeApprove(address(CNC_ETH_POOL), type(uint256).max);
         locker = ICNCLockerV2(cncLocker);
     }
@@ -94,7 +91,7 @@ contract RewardManager is IRewardManager, Ownable {
             cvxEarned = cvxEarned - cvxFee;
         }
 
-        uint256 _totalStaked = lpTokenStaker.getBalanceForPool(pool);
+        uint256 _totalStaked = controller.lpTokenStaker().getBalanceForPool(pool);
         if (_totalStaked > 0) {
             _updateEarned(_CVX_KEY, cvxEarned, _totalStaked);
             _updateEarned(_CRV_KEY, crvEarned, _totalStaked);
@@ -164,7 +161,7 @@ contract RewardManager is IRewardManager, Ownable {
 
         uint256 claimableCVX = convexHandler.computeClaimableConvex(claimableCRV);
         uint256 totalCVXEarned = CVX.balanceOf(pool) - _oldCvxBalance + claimableCVX;
-        uint256 totalCNCEarned = lpTokenStaker.claimableCnc(pool);
+        uint256 totalCNCEarned = controller.lpTokenStaker().claimableCnc(pool);
 
         if (totalCRVEarned > _rewardsMeta[_CRV_KEY].lastEarned) {
             crvEarned = totalCRVEarned - _rewardsMeta[_CRV_KEY].lastEarned;
@@ -182,7 +179,7 @@ contract RewardManager is IRewardManager, Ownable {
     }
 
     function _accountCheckpoint(address account) internal {
-        uint256 accountBalance = lpTokenStaker.getUserBalanceForPool(pool, account);
+        uint256 accountBalance = controller.lpTokenStaker().getUserBalanceForPool(pool, account);
         poolCheckpoint();
         _updateAccountRewardsMeta(_CNC_KEY, account, accountBalance);
         _updateAccountRewardsMeta(_CRV_KEY, account, accountBalance);
@@ -263,7 +260,7 @@ contract RewardManager is IRewardManager, Ownable {
         _sellRewardTokens();
 
         uint256 receivedCnc_ = CNC.balanceOf(pool) - cncBalanceBefore_;
-        uint256 _totalStaked = lpTokenStaker.getBalanceForPool(pool);
+        uint256 _totalStaked = controller.lpTokenStaker().getBalanceForPool(pool);
         if (_totalStaked > 0)
             _rewardsMeta[_CNC_KEY].earnedIntegral += receivedCnc_.divDown(_totalStaked);
         emit SoldRewardTokens(receivedCnc_);
@@ -271,7 +268,7 @@ contract RewardManager is IRewardManager, Ownable {
 
     /// @notice Claims all claimable CVX and CRV from Convex for all staked Curve LP tokens
     function _claimPoolEarnings() internal {
-        lpTokenStaker.claimCNCRewardsForPool(pool);
+        controller.lpTokenStaker().claimCNCRewardsForPool(pool);
 
         uint256 cvxBalance = CVX.balanceOf(pool);
         uint256 crvBalance = CRV.balanceOf(pool);
@@ -312,7 +309,7 @@ contract RewardManager is IRewardManager, Ownable {
 
         // Checking reward token isn't a Curve Pool LP Token
         address[] memory curvePools_ = IConicPool(pool).allCurvePools();
-        for (uint256 i = 0; i < curvePools_.length; i++) {
+        for (uint256 i; i < curvePools_.length; i++) {
             address curveLpToken_ = controller.curveRegistryCache().lpToken(curvePools_[i]);
             require(reward != curveLpToken_, "token not allowed");
         }
@@ -324,7 +321,7 @@ contract RewardManager is IRewardManager, Ownable {
     }
 
     function addBatchExtraRewards(address[] memory _rewards) external override onlyOwner {
-        for (uint256 i = 0; i < _rewards.length; i++) {
+        for (uint256 i; i < _rewards.length; i++) {
             addExtraReward(_rewards[i]);
         }
     }
@@ -361,10 +358,10 @@ contract RewardManager is IRewardManager, Ownable {
             uint256 cvxRewards
         )
     {
-        uint256 _totalStaked = lpTokenStaker.getBalanceForPool(pool);
+        uint256 _totalStaked = controller.lpTokenStaker().getBalanceForPool(pool);
         if (_totalStaked == 0) return (0, 0, 0);
         (uint256 crvEarned, uint256 cvxEarned, uint256 cncEarned) = _getEarnedRewards();
-        uint256 userBalance = lpTokenStaker.getUserBalanceForPool(pool, account);
+        uint256 userBalance = controller.lpTokenStaker().getUserBalanceForPool(pool, account);
 
         cncRewards = _getClaimableReward(
             account,

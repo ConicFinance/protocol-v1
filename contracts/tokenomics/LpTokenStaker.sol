@@ -2,8 +2,8 @@
 pragma solidity 0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
+import "./BaseMinter.sol";
 import "../../interfaces/tokenomics/ILpTokenStaker.sol";
 import "../../interfaces/tokenomics/IInflationManager.sol";
 import "../../interfaces/IController.sol";
@@ -12,7 +12,8 @@ import "../../interfaces/pools/ILpToken.sol";
 import "../../interfaces/tokenomics/ICNCToken.sol";
 import "../../libraries/ScaledMath.sol";
 
-contract LpTokenStaker is ILpTokenStaker, Ownable {
+/// @dev USD amounts in this contract are always scaled by 1e18
+contract LpTokenStaker is ILpTokenStaker, BaseMinter {
     using SafeERC20 for IERC20;
     using SafeERC20 for ILpToken;
     using ScaledMath for uint256;
@@ -20,7 +21,6 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         uint256 timeBoost;
         uint256 lastUpdated;
     }
-    ICNCToken public constant CNC = ICNCToken(0x9aE380F0272E2162340a5bB646c354271c0F5cFC);
 
     uint256 public constant MAX_BOOST = 10e18;
     uint256 public constant MIN_BOOST = 1e18;
@@ -29,18 +29,28 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
     uint256 public constant TVL_FACTOR = 50e18;
 
     mapping(address => mapping(address => uint256)) internal stakedPerUser;
-    mapping(address => uint256) public stakedPerPool;
+    mapping(address => uint256) internal _stakedPerPool;
     mapping(address => Boost) public boosts;
 
     mapping(address => uint256) public poolShares;
     mapping(address => uint256) public poolLastUpdated;
 
     IController public immutable controller;
-    IInflationManager public immutable inflationManager;
 
-    constructor(address controller_, address inflationManager_) Ownable() {
+    bool public isShutdown;
+
+    modifier notShutdown() {
+        require(!isShutdown, "LpTokenStaker: shutdown");
+        _;
+    }
+
+    constructor(
+        address controller_,
+        ICNCToken _cnc,
+        address _emergencyMinter
+    ) BaseMinter(_cnc, _emergencyMinter) {
         controller = IController(controller_);
-        inflationManager = IInflationManager(inflationManager_);
+        _initializeLastUpdated();
     }
 
     function stake(uint256 amount, address conicPool) external override {
@@ -55,7 +65,7 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         uint256 amount,
         address conicPool,
         address account
-    ) public override {
+    ) public override notShutdown {
         require(controller.isPool(conicPool), "not a conic pool");
         ILpToken lpToken = IConicPool(conicPool).lpToken();
         uint256 exchangeRate = IConicPool(conicPool).usdExchangeRate();
@@ -68,7 +78,7 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         // Actual staking
         lpToken.safeTransferFrom(msg.sender, address(this), amount);
         stakedPerUser[account][conicPool] += amount;
-        stakedPerPool[conicPool] += amount;
+        _stakedPerPool[conicPool] += amount;
     }
 
     function unstakeFor(
@@ -79,13 +89,36 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         require(controller.isPool(conicPool), "not a conic pool");
         require(stakedPerUser[msg.sender][conicPool] >= amount, "not enough staked");
         // Checkpoint all inflation logic
-        IConicPool(conicPool).rewardManager().accountCheckpoint(msg.sender);
-        _stakerCheckpoint(msg.sender, 0);
+        if (!isShutdown) {
+            IConicPool(conicPool).rewardManager().accountCheckpoint(msg.sender);
+            _stakerCheckpoint(msg.sender, 0);
+        }
         // Actual unstaking
-        ILpToken lpToken = IConicPool(conicPool).lpToken();
         stakedPerUser[msg.sender][conicPool] -= amount;
-        stakedPerPool[conicPool] -= amount;
-        lpToken.safeTransfer(account, amount);
+        _stakedPerPool[conicPool] -= amount;
+        IConicPool(conicPool).lpToken().safeTransfer(account, amount);
+    }
+
+    function unstakeFrom(uint256 amount, address account) public override {
+        require(controller.isPool(msg.sender), "only callable from conic pool");
+        require(stakedPerUser[account][msg.sender] >= amount, "not enough staked");
+        // Checkpoint all inflation logic
+        IConicPool(msg.sender).rewardManager().accountCheckpoint(account);
+        _stakerCheckpoint(account, 0);
+        // Actual unstaking
+        stakedPerUser[account][msg.sender] -= amount;
+        _stakedPerPool[msg.sender] -= amount;
+        IConicPool(msg.sender).lpToken().safeTransfer(account, amount);
+    }
+
+    function shutdown() external {
+        require(msg.sender == emergencyMinter, "LpTokenStaker: not emergency minter");
+        address[] memory pools = controller.listPools();
+        for (uint256 i; i < pools.length; i++) {
+            _claimCNCRewardsForPool(pools[i]);
+        }
+        isShutdown = true;
+        emit Shutdown();
     }
 
     function getUserBalanceForPool(address conicPool, address account)
@@ -98,7 +131,7 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
     }
 
     function getBalanceForPool(address conicPool) external view override returns (uint256) {
-        return stakedPerPool[conicPool];
+        return _stakedPerPool[conicPool];
     }
 
     function getCachedBoost(address user) external view returns (uint256) {
@@ -112,11 +145,15 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
     }
 
     function getBoost(address user) external view override returns (uint256) {
-        (uint256 userStaked, uint256 totalStaked) = _getTotalStakedForUserCommonDenomination(user);
-        if (totalStaked == 0 || userStaked == 0) {
+        if (isShutdown) return MIN_BOOST;
+        (uint256 userStakedUSD, uint256 totalStakedUSD) = _getTotalStakedForUserCommonDenomination(
+            user
+        );
+        if (totalStakedUSD == 0 || userStakedUSD == 0) {
             return MIN_BOOST;
         }
-        uint256 stakeBoost = ScaledMath.ONE + userStaked.divDown(totalStaked).mulDown(TVL_FACTOR);
+        uint256 stakeBoost = ScaledMath.ONE +
+            userStakedUSD.divDown(totalStakedUSD).mulDown(TVL_FACTOR);
 
         Boost storage userBoost = boosts[user];
         uint256 timeBoost = userBoost.timeBoost;
@@ -135,41 +172,45 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         return totalBoost;
     }
 
-    function updateBoost(address user) external override {
+    function updateBoost(address user) external override notShutdown {
         (uint256 userStaked, ) = _getTotalStakedForUserCommonDenomination(user);
         _updateTimeBoost(user, userStaked, 0);
     }
 
-    function claimCNCRewardsForPool(address pool) external override {
-        require(controller.isPool(pool), "not a pool");
+    function claimCNCRewardsForPool(address pool) external override notShutdown {
         require(
             msg.sender == address(IConicPool(pool).rewardManager()),
             "can only be called by reward manager"
         );
+        _claimCNCRewardsForPool(pool);
+    }
+
+    function _claimCNCRewardsForPool(address pool) internal {
+        require(controller.isPool(pool), "not a pool");
         checkpoint(pool);
         uint256 cncToMint = poolShares[pool];
         if (cncToMint == 0) {
             return;
         }
-        CNC.mint(address(pool), cncToMint);
-        inflationManager.executeInflationRateUpdate();
+        cnc.mint(address(pool), cncToMint);
+        controller.inflationManager().executeInflationRateUpdate();
         poolShares[pool] = 0;
         emit TokensClaimed(pool, cncToMint);
     }
 
     function claimableCnc(address pool) public view override returns (uint256) {
-        uint256 currentRate = inflationManager.getCurrentPoolInflationRate(pool);
+        if (isShutdown) return 0;
+        uint256 currentRate = controller.inflationManager().getCurrentPoolInflationRate(pool);
         uint256 timeElapsed = block.timestamp - poolLastUpdated[pool];
         return poolShares[pool] + (currentRate * timeElapsed);
     }
 
-    function _stakerCheckpoint(address account, uint256 amountAdded) internal {
-        (uint256 userStaked, ) = _getTotalStakedForUserCommonDenomination(account);
-        _updateTimeBoost(account, userStaked, amountAdded);
+    function _stakerCheckpoint(address account, uint256 amountAddedUSD) internal {
+        (uint256 userStakedUSD, ) = _getTotalStakedForUserCommonDenomination(account);
+        _updateTimeBoost(account, userStakedUSD, amountAddedUSD);
     }
 
-    function checkpoint(address pool) public override returns (uint256) {
-        if (poolLastUpdated[pool] == 0) poolLastUpdated[pool] = block.timestamp;
+    function checkpoint(address pool) public override notShutdown returns (uint256) {
         // Update the integral of total token supply for the pool
         uint256 timeElapsed = block.timestamp - poolLastUpdated[pool];
         if (timeElapsed == 0) return poolShares[pool];
@@ -179,19 +220,19 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
     }
 
     function poolCheckpoint(address pool) internal {
-        uint256 currentRate = inflationManager.getCurrentPoolInflationRate(pool);
+        uint256 currentRate = controller.inflationManager().getCurrentPoolInflationRate(pool);
         uint256 timeElapsed = block.timestamp - poolLastUpdated[pool];
         poolShares[pool] += (currentRate * timeElapsed);
     }
 
     function _updateTimeBoost(
         address user,
-        uint256 userStaked,
-        uint256 amountAdded
+        uint256 userStakedUSD,
+        uint256 amountAddedUSD
     ) internal {
         Boost storage userBoost = boosts[user];
 
-        if (userStaked == 0) {
+        if (userStakedUSD == 0) {
             userBoost.timeBoost = TIME_STARTING_FACTOR;
             userBoost.lastUpdated = block.timestamp;
             return;
@@ -204,13 +245,13 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         if (newBoost > ScaledMath.ONE) {
             newBoost = ScaledMath.ONE;
         }
-        if (amountAdded == 0) {
+        if (amountAddedUSD == 0) {
             userBoost.timeBoost = newBoost;
         } else {
-            uint256 newTotalStaked = userStaked + amountAdded;
+            uint256 newTotalStakedUSD = userStakedUSD + amountAddedUSD;
             userBoost.timeBoost =
-                newBoost.mulDown(userStaked.divDown(newTotalStaked)) +
-                TIME_STARTING_FACTOR.mulDown(amountAdded.divDown(newTotalStaked));
+                newBoost.mulDown(userStakedUSD.divDown(newTotalStakedUSD)) +
+                TIME_STARTING_FACTOR.mulDown(amountAddedUSD.divDown(newTotalStakedUSD));
         }
         userBoost.lastUpdated = block.timestamp;
     }
@@ -223,7 +264,7 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
         uint256 curExchangeRate = IConicPool(pool).usdExchangeRate();
 
         uint8 decimals = IConicPool(pool).lpToken().decimals();
-        poolStaked = stakedPerPool[pool].convertScale(decimals, 18).mulDown(curExchangeRate);
+        poolStaked = _stakedPerPool[pool].convertScale(decimals, 18).mulDown(curExchangeRate);
         poolUserStaked = stakedPerUser[account][pool].convertScale(decimals, 18).mulDown(
             curExchangeRate
         );
@@ -246,5 +287,12 @@ contract LpTokenStaker is ILpTokenStaker, Ownable {
             userStakedUSD += poolUserStakedUSD;
         }
         return (userStakedUSD, totalStakedUSD);
+    }
+
+    function _initializeLastUpdated() internal {
+        address[] memory pools = controller.listPools();
+        for (uint256 i; i < pools.length; i++) {
+            poolLastUpdated[pools[i]] = block.timestamp;
+        }
     }
 }

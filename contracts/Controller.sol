@@ -4,8 +4,10 @@ pragma solidity 0.8.17;
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
+import "./tokenomics/EmergencyMinter.sol";
 import "../interfaces/IController.sol";
 import "../interfaces/tokenomics/ILpTokenStaker.sol";
+import "../interfaces/vendor/IBooster.sol";
 
 contract Controller is IController, Ownable {
     using EnumerableSet for EnumerableSet.AddressSet;
@@ -14,13 +16,16 @@ contract Controller is IController, Ownable {
     uint256 internal constant _MIN_WEIGHT_UPDATE_MIN_DELAY = 1 days;
 
     EnumerableSet.AddressSet internal _pools;
-    address public immutable cncToken;
-    ICurveRegistryCache internal immutable _curveRegistryCache;
+    EnumerableSet.AddressSet internal _activePools;
 
-    address public override convexBooster;
+    address public immutable emergencyMinter;
+    address public immutable cncToken;
+
+    address public override convexBooster = address(0xF403C135812408BFbE8713b5A23a04b3D48AAE31);
     address public override curveHandler;
     address public override convexHandler;
     IOracle public override priceOracle;
+    ICurveRegistryCache public override curveRegistryCache;
 
     IInflationManager public override inflationManager;
     ILpTokenStaker public override lpTokenStaker;
@@ -31,35 +36,66 @@ contract Controller is IController, Ownable {
 
     constructor(address cncToken_, address curveRegistryCacheAddress_) {
         cncToken = cncToken_;
-        _curveRegistryCache = ICurveRegistryCache(curveRegistryCacheAddress_);
+        curveRegistryCache = ICurveRegistryCache(curveRegistryCacheAddress_);
+
+        EmergencyMinter emergencyMinter_ = new EmergencyMinter(ICNCToken(cncToken_), this);
+        emergencyMinter_.transferOwnership(msg.sender);
+        emergencyMinter = address(emergencyMinter_);
     }
 
-    function curveRegistryCache() external view override returns (ICurveRegistryCache) {
-        return _curveRegistryCache;
-    }
-
+    /// @notice this function is only callable by the owner or the emergencyMinter
+    /// the owner is only allowed to call this function to initialize the lpTokenStaker
+    /// the emergencyMinter is allowed to call this function to update the lpTokenStaker while it is active
+    /// the emergencyMinter is only active for 3 months, after which point the LP token staker will
+    /// effectively be immutable
     function setLpTokenStaker(address _lpTokenStaker) external {
-        require(address(lpTokenStaker) == address(0), "lpTokenStaker already set");
+        address currentTokenStaker = address(lpTokenStaker);
+        if (msg.sender == owner()) {
+            require(currentTokenStaker == address(0), "lpTokenStaker already set");
+        } else {
+            // this is to allow the emergencyMinter to set the lpTokenStaker while it is active
+            require(msg.sender == emergencyMinter, "only owner or emergencyMinter");
+        }
         lpTokenStaker = ILpTokenStaker(_lpTokenStaker);
+        for (uint256 i; i < _pools.length(); i++) {
+            lpTokenStaker.checkpoint(_pools.at(i));
+        }
     }
 
     function listPools() external view override returns (address[] memory) {
         return _pools.values();
     }
 
+    function listActivePools() external view override returns (address[] memory) {
+        return _activePools.values();
+    }
+
     function addPool(address poolAddress) external override onlyOwner {
-        require(_pools.add(poolAddress), "Failed to add pool");
+        require(_pools.add(poolAddress), "failed to add pool");
+        require(_activePools.add(poolAddress), "failed to add pool");
         lpTokenStaker.checkpoint(poolAddress);
         emit PoolAdded(poolAddress);
     }
 
     function removePool(address poolAddress) external override onlyOwner {
-        require(_pools.remove(poolAddress), "Failed to remove pool");
+        require(_pools.remove(poolAddress), "failed to remove pool");
+        require(!_activePools.contains(poolAddress), "shutdown the pool before removing it");
         emit PoolRemoved(poolAddress);
+    }
+
+    function shutdownPool(address poolAddress) external override onlyOwner {
+        require(_activePools.remove(poolAddress), "failed to remove pool");
+        IConicPool(poolAddress).shutdownPool();
+        inflationManager.updatePoolWeights();
+        emit PoolShutdown(poolAddress);
     }
 
     function isPool(address poolAddress) external view override returns (bool) {
         return _pools.contains(poolAddress);
+    }
+
+    function isActivePool(address poolAddress) external view override returns (bool) {
+        return _activePools.contains(poolAddress);
     }
 
     function updateWeights(WeightUpdate memory update) public override onlyOwner {
@@ -72,12 +108,13 @@ contract Controller is IController, Ownable {
     }
 
     function updateAllWeights(WeightUpdate[] memory weights) external override onlyOwner {
-        for (uint256 i = 0; i < weights.length; i++) {
+        for (uint256 i; i < weights.length; i++) {
             updateWeights(weights[i]);
         }
     }
 
     function setConvexBooster(address _convexBooster) external override onlyOwner {
+        require(IBooster(convexBooster).isShutdown(), "current booster is not shutdown");
         convexBooster = _convexBooster;
         emit ConvexBoosterSet(_convexBooster);
     }
@@ -102,13 +139,15 @@ contract Controller is IController, Ownable {
         emit PriceOracleSet(oracle);
     }
 
-    function setWeightUpdateMinDelay(uint256 delay) external onlyOwner {
+    function setCurveRegistryCache(address curveRegistryCache_) external override onlyOwner {
+        curveRegistryCache = ICurveRegistryCache(curveRegistryCache_);
+        emit CurveRegistryCacheSet(curveRegistryCache_);
+    }
+
+    function setWeightUpdateMinDelay(uint256 delay) external override onlyOwner {
         require(delay < _MAX_WEIGHT_UPDATE_MIN_DELAY, "delay too long");
         require(delay > _MIN_WEIGHT_UPDATE_MIN_DELAY, "delay too short");
         weightUpdateMinDelay = delay;
-    }
-
-    function _isCurvePool(address _pool) internal view returns (bool) {
-        return _curveRegistryCache.isRegistered(_pool);
+        emit WeightUpdateMinDelaySet(delay);
     }
 }
